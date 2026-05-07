@@ -1,9 +1,13 @@
 ---
 name: form-filler
 version: "4.0"
-description: "通用智能填表助手。自动从用户上传的表格模板/要求中提取字段，根据本地用户配置文件智能填充，支持 DOCX/Excel/PDF/图片/文字描述等多种输入格式，支持多条目选择（工作经历/获奖/论文），缺信息自动询问并更新配置，支持 AI 内容生成（自荐信/个人陈述），含信息源深度挖掘、缺失字段智能建议、后填写一致性校验、配置自动丰富、预览确认模式，可生成填写对照表供用户审核并输出成品文件。"
-description_zh: "通用智能填表助手。支持 DOCX/Excel/PDF/图片等格式的表格自动填写，含 OCR、AI 内容生成、信息源深度挖掘、一致性校验、缺失字段迭代收集"
-description_en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/image forms from user profile, with OCR, AI content generation, deep source mining, consistency validation, and progressive info collection."
+description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
+metadata:
+  openclaw:
+    always: false
+  i18n:
+    zh: "通用智能填表助手。支持 DOCX/Excel/PDF 等格式表格自动填写，含 OCR、AI 内容生成、信息源深度挖掘、一致性校验、缺失字段迭代收集"
+    en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/image forms from user profile, with OCR, AI content generation, deep source mining, consistency validation, and progressive info collection."
 ---
 
 # 智能填表助手（Form Filler）
@@ -127,7 +131,7 @@ description_en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/ima
 4. 将挖掘结果加入匹配结果集，进入 Step 2 映射
 ```
 
-**示例**：从李奎毅的奖学金申请扫描件中深度挖掘：
+**示例**：从奖学金申请扫描件中深度挖掘：
 - "云南省安宁中学" → birthplace="云南省安宁市"（中可信度）
 - "赛区云南" → 印证 birthplace 推断
 - "全国中学生物理竞赛决赛" → awards level="国家级"
@@ -136,13 +140,15 @@ description_en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/ima
 
 ---
 
-## Skill 目录结构
+## 目录结构
 
 ```
 form-filler/
-├── SKILL.md                    ← 本文件
+├── SKILL.md                    ← 本文件（核心定义）
+├── README.md                   ← 详细文档
+├── LICENSE                     ← MIT
 ├── .gitignore                  ← 配置隐私保护
-├── profiles/                   ← 用户配置文件目录（自动生成）
+├── profiles/                   ← 用户配置文件目录（自动生成，不入版本控制）
 │   ├── personal.yaml           ← 基础个人信息
 │   ├── contact.yaml            ← 联系方式
 │   ├── education.yaml          ← 教育经历（支持多条）
@@ -152,7 +158,8 @@ form-filler/
 │   ├── skills.yaml             ← 技能证书
 │   ├── league.yaml             ← 团组织/党建信息
 │   └── bank.yaml               ← 金融信息
-├── scripts/                    ← 辅助脚本（可选扩展）
+├── scripts/                    ← 辅助脚本
+│   └── fill_docx.py            ← DOCX 填写示例脚本
 └── templates/
     └── audit_table.md          ← 填写对照表模板
 ```
@@ -176,18 +183,18 @@ form-filler/
 
 | 输入形式 | 检测方法 | 处理方式 |
 |----------|----------|----------|
-| DOCX 文件（含 `{{字段名}}` 或 `${字段名}`） | 用 markitdown 转换后扫描模板标记 | 模板替换填充（Step 2B） |
-| DOCX/PDF 表格（含表格结构，无模板标记） | markitdown 转换后识别表格行列和表头 | 逐字段语义映射填充（Step 2A） |
+| DOCX 文件（含 `{{字段名}}` 或 `${字段名}`） | 用文档转换工具（如 markitdown CLI）转换后扫描模板标记 | 模板替换填充（Step 2B） |
+| DOCX/PDF 表格（含表格结构，无模板标记） | 文档转换后识别表格行列和表头 | 逐字段语义映射填充（Step 2A） |
 | Excel 申报表（.xlsx） | 检测文件扩展名 + 表头行 | 逐单元格填充 |
 | PDF 表单（含 AcroForm） | PyMuPDF 检测表单字段 | 字段级别填充 |
-| 扫描 PDF / 图片表格 | markitdown 无文字输出 → 判定为扫描件 | OCR 提取后按上述流程处理 |
+| 扫描 PDF / 图片表格 | 文档转换工具无文字输出 → 判定为扫描件 | OCR 提取后按上述流程处理 |
 | 文字描述（如"帮我填一个奖学金申请"） | 无文件上传 | LLM 提取字段清单 |
 | 信息源文件（非目标表格） | 用户指定"从XX文件提取信息" | 先提取信息 → 更新配置 → 再填目标表 |
 
 #### 扫描 PDF / 图片处理流程
 
 ```
-1. 先用 markitdown 尝试提取文字
+1. 先尝试用文档转换工具提取文字
 2. 若输出为空或极少文字（< 50字），判定为扫描件
 3. 用 pdf2image 或 PyMuPDF 将 PDF 转为 PNG（200 DPI）
 4. 用 RapidOCR (rapidocr-onnxruntime) 进行 OCR
@@ -198,7 +205,7 @@ form-filler/
    c. 手动输入关键信息
 ```
 
-**工具选择优先级**：markitdown → RapidOCR → 提示用户
+**工具选择优先级**：文档转换 → OCR → 提示用户
 
 **输出**：`字段清单 + 填写要求` 的结构化数据
 
@@ -330,7 +337,7 @@ for each 缺失字段:
 |------|----------|
 | 用户已有文件 | 直接挂载到输出目录 |
 | 需要 AI 生成内容（如自荐信） | 根据表格要求生成内容，另存为附件文件 |
-| 需要生成图片/PDF | 调用多模态生成 skill 或提示用户自行准备 |
+| 需要生成图片/PDF | 调用多模态生成工具/插件或提示用户自行准备 |
 | 无法生成（如证件照、扫描件） | 明确提示用户自行准备，在对照表中标注「待用户提供」 |
 
 ### Step 7: 生成填写结果
@@ -371,15 +378,13 @@ for each 缺失字段:
    ┌──────────────────────────────────────┐
    │ 预填方案预览                          │
    ├──────────────────────────────────────┤
-   │ ✅ 申报人姓名：李奎毅                 │
-   │ ✅ 所在单位：高分子科学系              │
-   │ 🔄 籍贯：云南省安宁市（推断，需确认）  │
+   │ ✅ 申报人姓名：XXX                    │
+   │ ✅ 所在单位：XX系                     │
+   │ 🔄 籍贯：XX省XX市（推断，需确认）     │
    │ ❌ 出生年月：缺失                     │
    │ 📝 申报材料：约800字（AI生成）         │
    ├──────────────────────────────────────┤
    │ 校验结果：1个阻断、1个提示             │
-   │ ❌ 必填字段"出生年月"为空              │
-   │ ⚠️ 籍贯为推断值，建议确认              │
    └──────────────────────────────────────┘
 4. 用户确认预填方案 → 进入 Step 8 生成文件
 5. 用户要求修改 → 回到对应步骤调整
@@ -403,11 +408,8 @@ for each 缺失字段:
    a. 信息源深度挖掘的推断值 → 如用户确认了推断值，保存到配置
    b. 用户手动补充的缺失字段 → 保存到对应配置文件
    c. AI生成的内容 → 不保存到配置（非事实性信息）
-   d. 计算推断结果 → 保存推算依据到配置（如年级="大二(2026年推断)"）
-2. 展示将要保存的新信息清单：
-   "以下信息将保存到您的配置文件：
-    - personal.yaml: birthplace=云南省安宁市
-    - education.yaml: school_type=985/双一流"
+   d. 计算推断结果 → 保存推算依据到配置
+2. 展示将要保存的新信息清单
 3. 用户确认 → 更新配置文件
 4. 用户拒绝 → 不保存，但下次填表仍会尝试推断
 ```
@@ -492,18 +494,10 @@ if count_chinese_chars(content) > max_chars:
 **5. 文件保存**
 
 ```python
-# 保存时确保输出目录存在
 import os
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
 doc.save(output_path)
 ```
-
-### Step 8: 用户审查确认
-
-- 展示填写对照表 + 成品文件
-- 用户确认 → 交付最终文件
-- 用户指出修改 → 回到 Step 7 调整
-- 用户要求重写 AI 生成内容 → 回到 Step 5 重新生成
 
 ---
 
@@ -549,40 +543,77 @@ doc.save(output_path)
 
 ## 工具集成指南
 
-### 文件读取
+### Python 库（跨平台通用）
 
-| 工具 | 用途 |
-|------|------|
-| markitdown skill | DOCX/PDF → Markdown 转换（首选） |
-| Read tool | 读取 YAML 配置文件 |
-| PyMuPDF (fitz) | PDF 表单字段检测 + AcroForm 填充 |
-| pdf2image | PDF → PNG 转换 |
-| RapidOCR | 扫描件/图片 OCR 识别 |
+| 库 | 用途 | 安装 |
+|------|------|------|
+| python-docx | 生成填写后的 DOCX 文件 | `pip install python-docx` |
+| openpyxl | 填写 Excel 文件 | `pip install openpyxl` |
+| PyMuPDF (fitz) | PDF 表单字段检测 + AcroForm 填充 | `pip install PyMuPDF` |
+| pdf2image | PDF → PNG 转换 | `pip install pdf2image` |
+| RapidOCR | 扫描件/图片 OCR 识别（中文优先） | `pip install rapidocr-onnxruntime` |
+| PyYAML | 读写 YAML 配置文件 | `pip install pyyaml` |
 
-### 文件写入
+### Agent 平台功能（按平台适配）
 
-| 工具 | 用途 |
-|------|------|
-| python-docx | 生成填写后的 DOCX 文件 |
-| openpyxl | 填写 Excel 文件 |
-| PyMuPDF | 填充 PDF 表单 |
-| Write tool | 写入 YAML 配置文件 |
-| Edit tool | 更新 YAML 配置文件 |
-
-### 内容生成
-
-| 工具 | 用途 |
-|------|------|
-| LLM (当前模型) | 自荐信/个人陈述/理解类内容生成 |
-| 多模态生成 skill | 图片/3D 模型等附件生成 |
+| 功能 | 描述 | 各平台对应 |
+|------|------|-----------|
+| 文档转换 | DOCX/PDF → Markdown 转换 | markitdown CLI / pandoc / 平台内置转换 |
+| 文件读取 | 读取 YAML/文本/二进制文件 | 平台原生文件读取功能 |
+| 文件写入 | 写入 YAML/文本文件 | 平台原生文件写入功能 |
+| 文件编辑 | 更新已有文件内容 | 平台原生文件编辑功能 |
+| LLM 内容生成 | 自荐信/个人陈述/理解类内容 | 当前对话中的 LLM |
+| 多模态生成 | 图片/3D 模型等附件 | 平台多模态生成工具/插件 |
 
 ### 推荐依赖安装
 
 ```bash
-pip install rapidocr-onnxruntime pdf2image python-docx openpyxl PyMuPDF
+pip install rapidocr-onnxruntime pdf2image python-docx openpyxl PyMuPDF pyyaml
+# 可选：文档转换工具
+pip install markitdown  # 或使用 pandoc
 # Tesseract OCR (可选，作为 RapidOCR 的备选)
 # Windows: winget install UB-Mannheim.TesseractOCR
+# macOS: brew install tesseract
+# Linux: sudo apt install tesseract-ocr
 ```
+
+---
+
+## 平台兼容性
+
+### 支持的 Agent 平台
+
+| 平台 | 安装路径 | 文件名 | 说明 |
+|------|---------|--------|------|
+| Claude Code | `~/.claude/skills/form-filler/` | SKILL.md | Anthropic 官方 CLI |
+| WorkBuddy / CodeBuddy | `~/.workbuddy/skills/form-filler/` | SKILL.md | 国产 AI 编程助手 |
+| Cursor | `.cursor/skills/form-filler/` | SKILL.md | AI 代码编辑器 |
+| Cline | `.cline/skills/form-filler/` | SKILL.md | VS Code 扩展 |
+| OpenClaw | `skills/form-filler/` | SKILL.md | 开源 Agent 框架 |
+| Codex CLI | 项目根目录 `.codex/` | SKILL.md | OpenAI CLI |
+
+### 安装
+
+```bash
+# 方式1：git clone
+git clone https://github.com/quitli888-source/form-filler.git
+# 将目录复制到对应平台的 skills/ 路径下
+
+# 方式2：手动下载
+# 下载 SKILL.md + templates/ + scripts/ 到目标路径
+```
+
+### 平台差异适配
+
+不同 Agent 平台的文件操作方式不同，本模块描述的流程基于「能力」而非具体工具：
+
+| 本文档描述 | Claude Code | WorkBuddy | Cursor |
+|-----------|-------------|-----------|--------|
+| 文档转换工具 | markitdown CLI | markitdown skill | pandoc / 内置 |
+| 文件读取功能 | Read tool | Read tool | 内置 |
+| 文件写入功能 | Write tool | Write tool | 内置 |
+| 文件编辑功能 | Edit tool | Edit tool | 内置 |
+| 用户交互 | 直接对话 | 直接对话 | 直接对话 |
 
 ---
 
@@ -727,7 +758,7 @@ cardholder: ""
 - 配置文件的读写操作全部通过本地文件系统完成
 - 建议定期审查 `profiles/` 目录下的内容，删除不再需要的字段
 - 金融信息（bank.yaml）可额外手动加密存储
-- 如需分享 skill 给其他人使用，请确保不包含个人配置文件
+- 如需分享此模块给其他人使用，请确保不包含个人配置文件
 
 ---
 
@@ -736,53 +767,27 @@ cardholder: ""
 ### 场景：从奖学金申请PDF → 优秀团员申报表DOCX
 
 **输入**：
-- 信息源：适达学生奖申请表（10页扫描PDF）
-- 目标表：复旦大学优秀共青团员申报表（DOCX，含表格结构）
+- 信息源：奖学金申请表（10页扫描PDF）
+- 目标表：优秀共青团员申报表（DOCX，含表格结构）
 
 **执行流程**：
 
 ```
 Step 0: 检查profiles/ → 已有personal/contact/education/awards/league.yaml
-Step 1: 检测目标表 → DOCX表格（无模板标记）→ markitdown转换 → 识别18个字段
+Step 1: 检测目标表 → DOCX表格（无模板标记）→ 文档转换后识别18个字段
          检测信息源 → 扫描PDF → RapidOCR提取 → 深度挖掘隐含信息
-Step 2A: 语义字段映射 → 18个字段逐一匹配：
-         - "申报人姓名" → personal.name=李奎毅 ✅
-         - "所在单位" → education.department=高分子科学系 ✅
-         - "一寸免冠照" → 无法生成 ❌
-         - "出生年月" → 配置缺失，深度挖掘无结果 ❌
-         - "籍贯" → 深度挖掘："云南省安宁中学"→"云南省安宁市" 🔄
-         - "民族" → 不推断 ❌
-         - "政治面貌" → personal.political_status=共青团员 ✅
-         - "学历/年级" → 计算：2025-09+本科→"25级本科生" 🔄
-         - "手机" → contact.phone ✅
-         - "邮箱" → contact.email ✅
-         - "申报类别" → 推断：本科→"学生" 🔄
-         - "学号/工号" → education.student_id ✅
-         - "团员评议等级" → 缺失 ❌
-         - "个人简历" → AI聚合 ✅
-         - "所获荣誉" → awards.entries ✅
-         - "优秀团员理解" → AI生成 ✅
-         - "申报材料" → AI生成 ✅
-
-Step 3: 获奖列表 → 8条全部列出，按时间倒序
-Step 4: 缺失字段批量询问（含智能建议）：
-         1. 出生年月：____
-         2. 籍贯：云南省安宁市（推断自高中校名，确认？）
-         3. 民族：____
-         4. 团员评议等级：____
-         5. 一寸免冠照：需自行准备
-Step 5: AI生成申报材料(~800字) + 优秀团员理解(~200字)
+Step 2A: 语义字段映射 → 18个字段逐一匹配
+Step 3: 获奖列表 → 全部列出，按时间倒序
+Step 4: 缺失字段批量询问（含智能建议）
+Step 5: AI生成申报材料 + 理解类内容
 Step 6: 无额外附件需求
 Step 7: python-docx填写DOCX，生成对照表
-Step 7.5: 一致性校验 → 全部通过
-          预填方案预览 → 用户确认
+Step 7.5: 一致性校验 → 预填方案预览 → 用户确认
 Step 8: 交付已填写DOCX + 对照表
-Step 8.5: 自动丰富配置 →
-          personal.birthplace=云南省安宁市（用户确认了推断值）
-          education.school_type=985/双一流
+Step 8.5: 自动丰富配置（保存用户确认的推断值）
 ```
 
-**结果**：11/18 自动匹配 + 3 推断（含1个深度挖掘推断） + 4 缺失需用户补充
+**结果**：11/18 自动匹配 + 3 推断 + 4 缺失需用户补充
 **自动填充率**：78%（含推断确认后达89%）
 
 ---
