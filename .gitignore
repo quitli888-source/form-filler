@@ -20,3 +20,8 @@ __pycache__/
 
 # v5.0 内部状态文件
 profiles/.profile_counter
+
+# v6.2 临时测试产物 (Tester/Optimizer 跑出来的临时 docx/audit/yaml)
+tests/_tmp_out/
+tests/_tmp_profiles/
+tests/_tmp_*/
