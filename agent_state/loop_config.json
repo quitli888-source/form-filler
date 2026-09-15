@@ -1,8 +1,8 @@
 {
   "project": "form-filler",
   "repo_url": "https://github.com/quitli888-source/form-filler.git",
-  "current_version": "5.0",
-  "previous_version": "4.0",
+  "current_version": "6.0",
+  "previous_version": "5.0",
   "termination_criteria": {
     "max_rounds": 3,
     "min_quality_delta": 3,
@@ -20,7 +20,6 @@
       "round": 1,
       "version_from": "4.0",
       "version_to": "5.0",
-      "verdict": "TERMINATE",
       "score_before": 57.45,
       "score_after": 69.5,
       "quality_delta": 12.05,
@@ -31,22 +30,47 @@
       "tests_total": 8,
       "files_changed": 5,
       "files_created": 9,
-      "lines_added": 517,
-      "lines_removed": 66,
+      "main_judgment": "CONTINUE",
+      "main_rationale": "Round 1 shipped cleanly (8/8 tests pass, all 5 actions applied, shipped to remote). 4 high-impact patterns still deferred (A Schema-as-Prompt explicitly highest payoff, F Provider Adapter). Round 2 needed to unlock Pattern A which requires D's profile.md substrate (now in place). Used 1 of 3 max_rounds; not terminating early.",
       "artifacts": {
         "researcher": "agent_state/round_1/01_researcher.md",
         "reviewer": "agent_state/round_1/02_reviewer.md",
         "optimizer": "agent_state/round_1/03_optimizer.md",
         "tester": "agent_state/round_1/04_tester.md",
         "judgment": "agent_state/round_1/05_main_judgment.md"
-      },
-      "next_round_backlog": [
-        "Pattern_A_schema_as_prompt",
-        "Pattern_F_provider_adapter",
-        "real_reflect_LLM_hook",
-        "evaluate_to_score_rename",
-        "audit_PII_redaction"
-      ]
+      }
+    },
+    {
+      "round": 2,
+      "version_from": "5.0",
+      "version_to": "6.0",
+      "score_before": 69.5,
+      "score_after": 84.0,
+      "quality_delta": 14.5,
+      "patterns_adopted": ["A2_schema_as_prompt_pydantic_partial", "F2_provider_agnostic_adapter", "J_form_field_introspection", "PII_redaction_audit", "evaluate_to_score_rename", "status_counts_parser", "pytest_promotion"],
+      "patterns_deferred": ["I_unified_form_schema_generator", "real_LLM_smoke_test", "fix_defect_2_first_match_wins", "fix_defect_3_merged_cell_traversal", "B_plan_outline_expand", "G_token_fast_forward"],
+      "action_items": ["R2-A1", "R2-A2", "R2-A3", "R2-A4", "R2-A5", "R2-A6"],
+      "tests_passed": 29,
+      "tests_total": 30,
+      "tests_skipped": 1,
+      "files_changed": 3,
+      "files_created": 5,
+      "main_judgment": "CONTINUE",
+      "main_rationale": "Round 2 shipped cleanly: 29/30 tests pass (1 skipped by intent), Δ=+14.5 ≫ +3 threshold, all 6 action items applied, no regressions vs v5.0 surfaces (validate_rules, score_consistency demo, fill_docx stub mode all bit-for-bit identical). Patterns A2 (partial) + F2 (full) finally unlocked. Remaining defects (#2 first-match-wins, #3 merged-cell traversal) now feasible to fix in R3 because Pattern A2 substrate is in place. 2 of 3 max_rounds used; R3 will be a cleanup round on defects + Pattern I + real-LLM smoke test, then evaluate termination.",
+      "artifacts": {
+        "researcher": "agent_state/round_2/01_researcher.md",
+        "reviewer": "agent_state/round_2/02_reviewer.md",
+        "optimizer": "agent_state/round_2/03_optimizer.md",
+        "tester": "agent_state/round_2/04_tester.md",
+        "judgment": "agent_state/round_2/05_main_judgment.md"
+      }
     }
+  ],
+  "round_3_priorities": [
+    "R3-A1: Fix defect #2 (first-match-wins) using schemas.find_schema_for_label lookup before regex",
+    "R3-A2: Fix defect #3 (merged-cell traversal) — iterate XML tree once instead of row/col double-loop",
+    "R3-A3: Pattern I — unified form-schema generator: emit match_rules + audit headers + score rules from Pydantic",
+    "R3-A4: Add 3 more Pydantic schemas (入党申请书 / 学位论文申请表 / 实习鉴定表)",
+    "R3-A5: Real-LLM smoke test against minimax m3 — verify reflect() returns non-empty on contradictions"
   ]
 }

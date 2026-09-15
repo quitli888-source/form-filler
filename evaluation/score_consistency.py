@@ -238,26 +238,38 @@ def demo_details() -> list:
 
 def parse_audit_md(audit_path: Path):
     """
-    简化版 audit.md 解析：抓取「字段填写详情」表中的 填入值 列
-    （按 label → value 的 dict 返回）+ 状态 details 列表。
+    解析 audit.md 文件：
+      1. 抓取「字段填写详情」表 → label → value dict + details 列表
+      2. 抓取「状态统计」表 → status_counts dict（v6.0, R2-A5）
+
+    返回 (filled, details, status_counts)。
+    status_counts: {"✅": N, "🔄": N, "📝": N, "⚠️": N, "❌": N, ...}
     """
     if not audit_path.exists():
-        return {}, []
+        return {}, [], {}
     text = audit_path.read_text(encoding="utf-8")
     filled = {}
     details = []
-    in_table = False
+    status_counts = {}
+    in_details = False
+    in_stats = False
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if line.startswith("| 序号"):
-            in_table = True
+            in_details = True
+            in_stats = False
             continue
-        if in_table and line.startswith("|---"):
+        if line.startswith("| 状态") or line.startswith("| 状态类型") or "✅ 自动匹配" in line:
+            in_details = False
+            in_stats = True
+        if line.startswith("|---"):
             continue
-        if in_table and line.startswith("|"):
-            cells = [c.strip().strip("`") for c in line.strip("|").split("|")]
-            if len(cells) < 5:
-                continue
+        if not line.startswith("|"):
+            in_details = False
+            in_stats = False
+            continue
+        cells = [c.strip().strip("`") for c in line.strip("|").split("|")]
+        if in_details and len(cells) >= 5:
             try:
                 int(cells[0])
             except ValueError:
@@ -271,9 +283,15 @@ def parse_audit_md(audit_path: Path):
                 "label": label, "value": value, "source": source,
                 "status": status, "reflection": reflection,
             })
-        elif in_table and not line.startswith("|"):
-            in_table = False
-    return filled, details
+        elif in_stats and len(cells) >= 3:
+            # | 状态类型 | 数量 | 占比 |   — parse: cells[0]=状态类型, cells[1]=数量, cells[2]=占比
+            status_label = cells[0]
+            try:
+                n = int(cells[1])
+            except (ValueError, IndexError):
+                continue
+            status_counts[status_label] = n
+    return filled, details, status_counts
 
 
 def load_profile_yaml(profile_dir: Path) -> dict:
@@ -295,7 +313,17 @@ def load_profile_yaml(profile_dir: Path) -> dict:
 
 
 def evaluate(profile: dict, filled: dict, details: list) -> dict:
-    """跑 9 条规则，返回结构化结果。"""
+    """DEPRECATED alias of `score()` — 保留 v5.0 调用方兼容。新代码请用 `score`."""
+    import warnings
+    warnings.warn(
+        "evaluation.score_consistency.evaluate is deprecated; use score() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
+    return score(profile, filled, details)
+
+
+def score(profile: dict, filled: dict, details: list) -> dict:
+    """v6.0 跑 9 条规则，返回结构化结果（v5.0 evaluate 的新规范名）。"""
     blocking_errors = 0
     warnings = 0
     rule_results = []
@@ -314,10 +342,10 @@ def evaluate(profile: dict, filled: dict, details: list) -> dict:
     miss = sum(1 for d in details if d.get("status") == "❌")
     fill_rate_pct = round((total - miss) / total * 100, 1)
 
-    score = max(0, min(100, 100 - 20 * blocking_errors - 5 * warnings))
+    score_val = max(0, min(100, 100 - 20 * blocking_errors - 5 * warnings))
 
     return {
-        "score": score,
+        "score": score_val,
         "blocking_errors": blocking_errors,
         "warnings": warnings,
         "fill_rate_pct": fill_rate_pct,
@@ -326,7 +354,7 @@ def evaluate(profile: dict, filled: dict, details: list) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="form-filler v5.0 一致性评分脚本")
+    parser = argparse.ArgumentParser(description="form-filler v6.0 一致性评分脚本")
     parser.add_argument("--audit", default=None,
                         help="audit.md 路径（默认 demo run）")
     parser.add_argument("--profiles", default="./profiles",
@@ -342,13 +370,16 @@ def main():
         details = demo_details()
         if not args.demo:
             print("ℹ️ 未指定 --audit，使用 demo run（内置合成数据）", file=sys.stderr)
+        status_counts = {}  # demo 模式没有 status_counts
     else:
         audit_path = Path(args.audit)
         profile_dir = Path(args.profiles)
-        filled, details = parse_audit_md(audit_path)
+        filled, details, status_counts = parse_audit_md(audit_path)
         profile = load_profile_yaml(profile_dir)
 
-    result = evaluate(profile, filled, details)
+    result = score(profile, filled, details)
+    if status_counts:
+        result["status_counts"] = status_counts
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
     return 0 if result["blocking_errors"] == 0 else 1

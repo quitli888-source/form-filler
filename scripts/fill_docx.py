@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DOCX 表格填写示例脚本 — form-filler 辅助工具 (v5.0)
+DOCX 表格填写示例脚本 — form-filler 辅助工具 (v6.0)
 
 功能：
   1. 读取 DOCX 表格模板，识别字段结构
@@ -9,20 +9,30 @@ DOCX 表格填写示例脚本 — form-filler 辅助工具 (v5.0)
   4. 处理合并单元格
   5. 生成填写对照表（audit.md 文件）
   6. (v5.0) 生成 profile.md 中间产物（Step 2.5）
-  7. (v5.0) 可选的 Reflexion 自检反思（Step 5.5）
+  7. (v5.0→v6.0) Reflexion 自检反思走 Model Adapter（默认 Stub，可选 OpenAI 兼容）
+  8. (v6.0) AI 生成字段走 Pydantic schema-as-prompt（可选；instructor 未装则降级）
+  9. (v6.0) 审计表 PII 字段脱敏（手机/邮箱/身份证）
+ 10. (v6.0) `--introspect-out` 持久化 form-field 扫描结果为 JSON
 
 用法：
   python fill_docx.py --template 优秀团员申报表.docx --profile-dir ./profiles --output 优秀团员申报表_已填写.docx
   python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx --reflexion-rounds 1
   python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx --write-profile
   python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx --audit-out ./audit.md
+  # 启用真实 LLM（默认 stub）
+  python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx \
+      --provider openai-compatible --llm-model-name MiniMax-M3 \
+      --llm-base-url https://api.minimax.chat/v1 --llm-api-key $LLM_API_KEY \
+      --reflexion-rounds 1
 
 依赖：
   pip install python-docx pyyaml
+  可选（启用真实 LLM / schema-as-prompt）：pip install openai instructor pydantic
 """
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
@@ -30,6 +40,17 @@ from pathlib import Path
 
 import yaml
 from docx import Document
+
+# 让 scripts/ 子目录互相 import
+sys.path.insert(0, str(Path(__file__).parent))
+from model_adapter import StubAdapter, get_adapter  # noqa: E402
+
+# 可选依赖：pydantic + schemas（缺失则降级到 v5.0 行为）
+try:
+    from evaluation.schemas import SCHEMAS, find_schema_for_label  # noqa: E402
+except Exception:  # ImportError or evaluation package missing
+    SCHEMAS = {}
+    find_schema_for_label = lambda label: None  # noqa: E731
 
 
 def load_profiles(profile_dir: str) -> dict:
@@ -78,6 +99,92 @@ def scan_docx_tables(doc_path: str) -> list:
                     print(f"  [{ri},{ci}] {label}: {text[:30]}")
 
     return fields
+
+
+def scan_docx_introspect(doc_path: str) -> dict:
+    """v6.0 (R2-A3, Pattern J): 把 scan_docx_tables 结果持久化为可序列化的 JSON 结构。
+
+    用途：供下游 Schema 选择 / Round 3+ 自动化回归测试使用。
+    不依赖任何运行时状态；纯静态扫描。
+    """
+    doc = Document(doc_path)
+    tables_data = []
+    for ti, table in enumerate(doc.tables):
+        seen_cells = set()
+        rows = []
+        for ri, row in enumerate(table.rows):
+            cells = []
+            for ci, cell in enumerate(row.cells):
+                cell_id = id(cell._tc)
+                if cell_id in seen_cells:
+                    cells.append({"row": ri, "col": ci, "text": "", "is_label": False, "merged_dup": True})
+                    continue
+                seen_cells.add(cell_id)
+                text = cell.text.strip()
+                cells.append({
+                    "row": ri, "col": ci, "text": text,
+                    "is_label": _is_likely_label(text),
+                    "merged_dup": False,
+                })
+            rows.append(cells)
+        tables_data.append({
+            "index": ti,
+            "rows": len(table.rows),
+            "cols": len(table.columns),
+            "cells": rows,
+        })
+    from datetime import datetime
+    return {
+        "template": str(Path(doc_path).name),
+        "scanned_at": datetime.now().isoformat(timespec="seconds"),
+        "tables": tables_data,
+        "labels": [
+            {"table": ti, "row": f["row"], "col": f["col"], "text": f["text"]}
+            for f in [
+                {"table": ti, "row": ri, "col": ci, "text": text, "is_label": _is_likely_label(text)}
+                for ti, table in enumerate(doc.tables)
+                for ri, row in enumerate(table.rows)
+                for ci, cell in enumerate({id(c._tc): c for c in row.cells}.values())
+                for text in [cell.text.strip()]
+                if text
+            ]
+            if f["is_label"]
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# v6.0 新增：PII 脱敏（手机/邮箱/身份证/银行卡），用于 audit 写入前
+# ---------------------------------------------------------------------------
+
+PHONE_PAT = re.compile(r"(?<![\d])(1\d{2})\d{4}(\d{4})(?![\d])")
+EMAIL_PAT = re.compile(r"(?<![@\w])(\w[\w.+-]*[A-Za-z0-9])@(\w[\w.-]*\.[A-Za-z]{2,})(?![\w.])")
+ID_NUMBER_PAT = re.compile(r"(?<![\d])(\d{6})\d{8}(\d{3}[\dXx])(?![\d])")
+CARD_PAT = re.compile(r"(?<![\d])(\d{4})\d{6,11}(\d{4})(?![\d])")
+
+
+def _redact(value: str) -> str:
+    """Mask obvious PII patterns. Best-effort; never raises.
+
+    Patterns (with negative lookarounds to avoid false matches):
+      - 手机号: 11 位数字，1 开头，前后无其他数字
+      - 邮箱: ASCII local-part + @ + domain，前无 @/word 字符，后无 word/dot 字符
+      - 身份证: 18 位（6 位地区 + 8 位生日 + 3 位 + 校验位 Xx/digit），前后无其他数字
+      - 银行卡: 13–19 位数字，前后无其他数字（避免误伤学号）
+    """
+    if not value:
+        return value
+    s = str(value)
+    s = PHONE_PAT.sub(r"\1****\2", s)
+    s = EMAIL_PAT.sub(r"***@\2", s)
+    s = ID_NUMBER_PAT.sub(r"\1********\2", s)
+    s = CARD_PAT.sub(r"\1******\2", s)
+    return s
+
+
+def _redact_label(label: str) -> bool:
+    """这个 label 本身就是 PII（写入对照表的字段名行）。True 表示需要脱敏。"""
+    return any(k in label for k in ("手机", "邮箱", "身份证", "银行卡"))
 
 
 def _is_likely_label(text: str) -> bool:
@@ -203,27 +310,15 @@ def match_field(label: str, profiles: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# v5.0 新增：Reflexion 自检反思（plumbing-only stub）
+# v5.0→v6.0 升级：Reflexion 走 Model Adapter
 # ---------------------------------------------------------------------------
 
 def _stub_reflect(field_label: str, field_value, all_filled_so_far: dict) -> str:
+    """Back-compat alias for StubAdapter().reflect() — 保持 v5.0 行为。
+
+    测试代码可通过 fill_docx(_reflect_impl=...) 注入自定义 reflect 函数。
     """
-    v5.0 Step 5.5 自检反思的 plumbing-only 占位实现。
-
-    在真实运行中，此函数应对每个已填字段调用一次 LLM，prompt 模板见 SKILL.md
-    Step 5.5，返回 1-2 句反思文本或 "OK"。当前实现返回 ""（即"无问题"），
-    确保 fill_docx.py 在没有 LLM 时仍能端到端跑通。
-
-    测试用例可通过 fill_docx(_reflect_impl=...) 注入假实现来验证 plumbing。
-
-    TODO（v5.x / 真实 LLM 接入）:
-        def _stub_reflect(field_label, field_value, all_filled_so_far) -> str:
-            prompt = build_reflexion_prompt(field_label, field_value, all_filled_so_far)
-            response = call_llm(prompt)  # 由 model_adapter 提供
-            return response.strip()
-    """
-    # No-LLM stub: always return empty string (== "no objection")
-    return ""
+    return StubAdapter().reflect(field_label, field_value, {"filled_so_far": all_filled_so_far})
 
 
 # 保留 reflect() 作为 _stub_reflect 的兼容别名（v5.0 文档中曾用此名）
@@ -460,23 +555,29 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
               reflexion_rounds: int = 0,
               profile_md_dir: str = None,
               profile_counter_dir: str = None,
-              _reflect_impl=None) -> dict:
+              _reflect_impl=None,
+              adapter=None,
+              schema_ai_generate: bool = True) -> dict:
     """
     填写 DOCX 表格：
     1. 遍历所有表格的标签单元格
     2. 语义匹配 → 找到配置值
     3. 填入相邻的值单元格
     4. 处理合并单元格
-    5. 可选：对每个填入字段调用 _stub_reflect() 做自检反思
-    6. 保存结果
+    5. 可选：对每个填入字段调用 adapter.reflect() 做自检反思
+    6. (v6.0) PII 字段在写入 audit 前脱敏
+    7. 保存结果
 
-    reflexion_rounds: 自检反思轮数（0 = 关闭，1 = 默认）。每轮会调用 _stub_reflect()，
+    reflexion_rounds: 自检反思轮数（0 = 关闭，1 = 默认）。每轮会调用 adapter.reflect()，
                       反思非空则把反思写入 audit entry 并把状态降级为 ⚠️。
     profile_md_dir: 若提供，则调用 write_profile_md() 把 profile.md 写到该目录
                     （默认建议 = output DOCX 同目录，避免污染 profiles/）。
     profile_counter_dir: 计数器文件目录（默认 profiles/），仅持久化版本号 N。
-    _reflect_impl: 可选，注入测试替身；缺省使用 _stub_reflect。
-    """
+    _reflect_impl: 可选，注入测试替身；缺省使用 adapter.reflect()。
+    adapter: 可选，注入 ModelAdapter 实例；缺省 = StubAdapter()（v5.0 行为）。
+    schema_ai_generate: 当 AI 生成字段（📝）匹配到一个 Pydantic schema 时，
+                       是否尝试用 adapter.generate_struct() 生成受约束的内容；
+                       失败或关闭时回退到原始 prompt。"""
     if profile_md_dir:
         try:
             sha = write_profile_md(
@@ -490,7 +591,11 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
 
     doc = Document(template_path)
     audit = {"filled": 0, "missed": 0, "inferred": 0, "details": []}
-    reflect_fn = _reflect_impl if _reflect_impl is not None else _stub_reflect
+    if adapter is None:
+        adapter = StubAdapter()
+    reflect_fn = _reflect_impl if _reflect_impl is not None else (
+        lambda lbl, val, ctx: adapter.reflect(lbl, val, {"filled_so_far": ctx})
+    )
 
     for table in doc.tables:
         seen_cells = set()
@@ -528,7 +633,7 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                 else:
                     status_icon = "❌"
 
-                # Step 5.5 自检反思（plumbing-only stub，可注入测试替身）
+                # Step 5.5 自检反思（走 adapter；StubAdapter 返回 "" = 无意见）
                 reflection_text = ""
                 if reflexion_rounds > 0 and filled_value:
                     filled_so_far = {
@@ -544,9 +649,11 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
 
                 if filled_value:
                     audit["filled"] += 1
+                    # v6.0: PII 脱敏后再写入 audit（手机/邮箱/身份证/银行卡）
+                    audit_value = _redact(filled_value) if _redact_label(text) else filled_value
                     audit["details"].append({
                         "label": text,
-                        "value": filled_value,
+                        "value": audit_value,
                         "source": f"{result['config_file']}.yaml",
                         "status": status_icon,
                         "reflection": reflection_text,
@@ -606,21 +713,35 @@ def print_audit(audit: dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DOCX 表格填写工具 (form-filler v5.0)")
+    parser = argparse.ArgumentParser(description="DOCX 表格填写工具 (form-filler v6.0)")
     parser.add_argument("--template", required=True, help="DOCX 模板文件路径")
     parser.add_argument("--profile-dir", default="./profiles", help="配置文件目录")
     parser.add_argument("--output", default=None, help="输出文件路径")
     parser.add_argument("--scan-only", action="store_true", help="仅扫描不填写")
     parser.add_argument("--reflexion-rounds", type=int, default=0,
-                        help="v5.0 Reflexion 自检反思轮数（默认 0 = 关闭，1 = 推荐）")
+                        help="v5.0+ Reflexion 自检反思轮数（默认 0 = 关闭，1 = 推荐）")
     parser.add_argument("--audit-out", default=None,
-                        help="v5.0 填写对照表输出路径（默认 {output_basename}_audit.md）")
+                        help="v5.0+ 填写对照表输出路径（默认 {output_basename}_audit.md）")
     parser.add_argument("--audit-template", default="templates/audit_table.md",
-                        help="v5.0 对照表模板路径")
+                        help="v5.0+ 对照表模板路径")
     parser.add_argument("--write-profile", action="store_true",
-                        help="v5.0 先生成 profile.md 中间产物，再填写")
+                        help="v5.0+ 先生成 profile.md 中间产物，再填写")
     parser.add_argument("--table-name", default=None,
-                        help="v5.0 写入对照表的「表格名称」字段")
+                        help="v5.0+ 写入对照表的「表格名称」字段")
+    # v6.0 新增
+    parser.add_argument("--provider", default="stub",
+                        choices=["stub", "openai-compatible"],
+                        help="v6.0 Model Adapter provider (默认 stub = v5.0 行为；openai-compatible 启用真实 LLM)")
+    parser.add_argument("--llm-base-url", default=None,
+                        help="v6.0 OpenAI 兼容 endpoint base URL (也可 LLM_BASE_URL 环境变量)")
+    parser.add_argument("--llm-api-key", default=None,
+                        help="v6.0 API key (也可 LLM_API_KEY 环境变量)")
+    parser.add_argument("--llm-model-name", default=None,
+                        help="v6.0 模型名 (也可 LLM_MODEL_NAME 环境变量)")
+    parser.add_argument("--introspect-out", default=None,
+                        help="v6.0 持久化表格扫描结果为 JSON (Pattern J)")
+    parser.add_argument("--no-schema-ai", action="store_true",
+                        help="v6.0 关闭 Pydantic schema-as-prompt，强制走原始 prompt 路径")
 
     args = parser.parse_args()
 
@@ -631,9 +752,31 @@ def main():
         print("❌ 未找到配置文件，请先创建 profiles/ 目录并添加 YAML 文件")
         sys.exit(1)
 
+    # v6.0: 初始化 Model Adapter（默认 stub 保持 v5.0 行为）
+    adapter = get_adapter(
+        provider=args.provider,
+        base_url=args.llm_base_url,
+        api_key=args.llm_api_key,
+        model_name=args.llm_model_name,
+    )
+    print(f"🤖 Model Adapter: {adapter.name} (live={adapter.is_live()})")
+
     # 扫描模板
     print(f"\n🔍 扫描模板: {args.template}")
     fields = scan_docx_tables(args.template)
+
+    # v6.0: --introspect-out 持久化扫描结果（Pattern J）
+    if args.introspect_out:
+        try:
+            intro = scan_docx_introspect(args.template)
+            Path(args.introspect_out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.introspect_out).write_text(
+                json.dumps(intro, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"📥 introspect 已写入: {args.introspect_out}")
+        except Exception as exc:
+            print(f"⚠️ introspect 写入失败: {exc}")
 
     if args.scan_only:
         print(f"\n📊 共发现 {len(fields)} 个单元格")
@@ -648,10 +791,12 @@ def main():
     audit = fill_docx(args.template, profiles, output,
                       reflexion_rounds=args.reflexion_rounds,
                       profile_md_dir=profile_md_dir,
-                      profile_counter_dir=profile_counter_dir)
+                      profile_counter_dir=profile_counter_dir,
+                      adapter=adapter,
+                      schema_ai_generate=not args.no_schema_ai)
     print_audit(audit)
 
-    # v5.0: 写入 audit.md 文件
+    # v5.0+: 写入 audit.md 文件
     audit_path = args.audit_out or (str(Path(output).with_suffix("")) + "_audit.md")
     try:
         audit["table_name"] = args.table_name or Path(args.template).stem
