@@ -1,0 +1,19 @@
+[
+  {
+    "name": "minimal_good_case",
+    "description": "最小可用场景：姓名/性别/手机 各一条",
+    "labels": ["姓名", "性别", "手机号码"],
+    "profile": {
+      "personal": {"name": "<synth>", "gender": "男"},
+      "contact": {"phone": "13800000000"}
+    }
+  },
+  {
+    "name": "extra_no_match_label",
+    "description": "含一条完全无匹配的字段（应 FAIL）",
+    "labels": ["姓名", "随机未知字段XYZ"],
+    "profile": {
+      "personal": {"name": "<synth>"}
+    }
+  }
+]

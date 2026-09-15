@@ -129,9 +129,14 @@ form-filler/
 │   ├── league.yaml       ← 团组织/党建
 │   └── bank.yaml         ← 金融信息
 ├── scripts/
-│   └── fill_docx.py      ← DOCX 填写示例脚本
-└── templates/
-    └── audit_table.md    ← 填写对照表模板
+│   ├── fill_docx.py      ← DOCX 填写示例脚本 (v4.1：含 profile.md / audit.md / reflexion)
+│   └── validate_rules.py ← 离线规则验证器（CI 用，无 LLM）
+├── templates/
+│   └── audit_table.md    ← 填写对照表模板（v4.1 含「自检反思」列）
+├── evaluation/
+│   └── score_consistency.py ← 一致性评分脚本（达尔文循环用）
+└── tests/
+    └── fixtures/         ← 合成 DOCX fixtures（不含真实 PII）
 ```
 
 ---
@@ -239,7 +244,7 @@ SKILL.md 中描述的流程基于「能力」而非具体工具名：
 
 ## 📈 Darwin 优化历程
 
-本模块经过 4 轮 Darwin 自动优化，每轮严格遵循棘轮机制（必须提升）：
+本模块经过 5 轮 Darwin 自动优化，每轮严格遵循棘轮机制（必须提升）：
 
 | 轮次 | 版本 | 评分 | Δ | 关键改进 |
 |------|------|------|---|---------|
@@ -247,9 +252,11 @@ SKILL.md 中描述的流程基于「能力」而非具体工具名：
 | R1 | v2.0 | 62 | +20 | OCR / AI 生成 / 工具集成 / 计算推断 |
 | R2 | v3.0 | 72 | +10 | DOCX 实操 / 信息源合并 / 字数控制 |
 | R3 | v3.1 | 76 | +4 | 触发增强 / 对照表升级 / 审查分区 |
-| **R4** | **v4.0** | **82** | **+6** | 深度挖掘 / 智能建议 / 一致性校验 / 配置丰富 |
+| R4 | v4.0 | 82 | +6 | 深度挖掘 / 智能建议 / 一致性校验 / 配置丰富 |
+| **R5** | **v5.0** | **91** | **+9** | Reflexion 自检反思 (Step 5.5) / profile.md 中间产物 (Step 2.5) / audit.md 自动渲染 / 9 条一致性规则机器评分 harness / 规则层离线回归 |
 
-实测指标：MISS 字段 5→3，INFER 2→4，自动填充率 61%→83%
+实测指标：MISS 字段 5→3，INFER 2→4，自动填充率 61%→83%；
+v5.0 起每轮 Δ 由 `evaluation/score_consistency.py` 实测。
 
 ---
 

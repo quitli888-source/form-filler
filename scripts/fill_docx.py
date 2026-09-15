@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-DOCX 表格填写示例脚本 — form-filler 辅助工具
+DOCX 表格填写示例脚本 — form-filler 辅助工具 (v5.0)
 
 功能：
   1. 读取 DOCX 表格模板，识别字段结构
   2. 从 YAML 配置文件加载用户信息
   3. 语义匹配字段 → 自动填写
   4. 处理合并单元格
-  5. 生成填写对照表
+  5. 生成填写对照表（audit.md 文件）
+  6. (v5.0) 生成 profile.md 中间产物（Step 2.5）
+  7. (v5.0) 可选的 Reflexion 自检反思（Step 5.5）
 
 用法：
   python fill_docx.py --template 优秀团员申报表.docx --profile-dir ./profiles --output 优秀团员申报表_已填写.docx
+  python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx --reflexion-rounds 1
+  python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx --write-profile
+  python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx --audit-out ./audit.md
 
 依赖：
   pip install python-docx pyyaml
 """
 
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -95,47 +101,6 @@ def _is_likely_label(text: str) -> bool:
     return False
 
 
-def match_field(label: str, profiles: dict) -> dict:
-    """语义匹配：将表格标签映射到配置文件字段"""
-    # 匹配规则表（标签关键词 → 配置路径）
-    match_rules = [
-        # (正则模式, 配置文件, 字段路径, 转换函数)
-        (r"申报人姓名|申请人|姓名", "personal", "name", None),
-        (r"性别", "personal", "gender", None),
-        (r"民族", "personal", "ethnicity", None),
-        (r"籍贯|出生地", "personal", "birthplace", None),
-        (r"出生年月|出生日期", "personal", "birth_date", None),
-        (r"政治面貌", "personal", "political_status", None),
-        (r"手机|电话", "contact", "phone", None),
-        (r"邮箱|电子邮件", "contact", "email", None),
-        (r"学号|工号", "education", "entries.0.student_id", None),
-        (r"专业", "education", "entries.0.major", None),
-        (r"院系", "education", "entries.0.department", None),
-        (r"学校", "education", "entries.0.school", None),
-        (r"学历|年级", "education", "entries.0.degree", _compute_grade),
-        (r"所在单位", "education", None, _compute_workplace),
-        (r"申报类别", "education", "entries.0.degree", _compute_category),
-        (r"团员评议|评议等级", "league", "league_evaluation", None),
-        (r"入团日期", "league", "league_join_date", None),
-        (r"党内职务|团内职务", "league", "league_position", None),
-    ]
-
-    for pattern, config_file, field_path, transform in match_rules:
-        if re.search(pattern, label):
-            value = _get_nested_value(profiles.get(config_file, {}), field_path) if field_path else None
-            if transform:
-                value = transform(profiles)
-            return {
-                "matched": True,
-                "config_file": config_file,
-                "field_path": field_path,
-                "value": value,
-                "status": "✅" if value else "❌",
-            }
-
-    return {"matched": False, "value": None, "status": "❓"}
-
-
 def _get_nested_value(data: dict, path: str):
     """按点分路径获取嵌套字典值，如 entries.0.student_id"""
     keys = path.split(".")
@@ -194,13 +159,291 @@ def _compute_category(profiles: dict) -> str:
     return None
 
 
+# 匹配规则表（模块级常量，供 validate_rules.py 等导入使用）
+# 格式: (正则模式, 配置文件, 字段路径, 转换函数)
+# 转换函数接收 profiles dict，返回字符串或 None
+match_rules = [
+    (r"申报人姓名|申请人|姓名", "personal", "name", None),
+    (r"性别", "personal", "gender", None),
+    (r"民族", "personal", "ethnicity", None),
+    (r"籍贯|出生地", "personal", "birthplace", None),
+    (r"出生年月|出生日期", "personal", "birth_date", None),
+    (r"政治面貌", "personal", "political_status", None),
+    (r"手机|电话", "contact", "phone", None),
+    (r"邮箱|电子邮件", "contact", "email", None),
+    (r"学号|工号", "education", "entries.0.student_id", None),
+    (r"专业", "education", "entries.0.major", None),
+    (r"院系", "education", "entries.0.department", None),
+    (r"学校", "education", "entries.0.school", None),
+    (r"学历|年级", "education", "entries.0.degree", _compute_grade),
+    (r"所在单位", "education", None, _compute_workplace),
+    (r"申报类别", "education", "entries.0.degree", _compute_category),
+    (r"团员评议|评议等级", "league", "league_evaluation", None),
+    (r"入团日期", "league", "league_join_date", None),
+    (r"党内职务|团内职务", "league", "league_position", None),
+]
+
+
+def match_field(label: str, profiles: dict) -> dict:
+    """语义匹配：将表格标签映射到配置文件字段"""
+    for pattern, config_file, field_path, transform in match_rules:
+        if re.search(pattern, label):
+            value = _get_nested_value(profiles.get(config_file, {}), field_path) if field_path else None
+            if transform:
+                value = transform(profiles)
+            return {
+                "matched": True,
+                "config_file": config_file,
+                "field_path": field_path,
+                "value": value,
+                "status": "✅" if value else "❌",
+            }
+
+    return {"matched": False, "value": None, "status": "❓"}
+
+
+# ---------------------------------------------------------------------------
+# v5.0 新增：Reflexion 自检反思（plumbing-only stub）
+# ---------------------------------------------------------------------------
+
+def _stub_reflect(field_label: str, field_value, all_filled_so_far: dict) -> str:
+    """
+    v5.0 Step 5.5 自检反思的 plumbing-only 占位实现。
+
+    在真实运行中，此函数应对每个已填字段调用一次 LLM，prompt 模板见 SKILL.md
+    Step 5.5，返回 1-2 句反思文本或 "OK"。当前实现返回 ""（即"无问题"），
+    确保 fill_docx.py 在没有 LLM 时仍能端到端跑通。
+
+    测试用例可通过 fill_docx(_reflect_impl=...) 注入假实现来验证 plumbing。
+
+    TODO（v5.x / 真实 LLM 接入）:
+        def _stub_reflect(field_label, field_value, all_filled_so_far) -> str:
+            prompt = build_reflexion_prompt(field_label, field_value, all_filled_so_far)
+            response = call_llm(prompt)  # 由 model_adapter 提供
+            return response.strip()
+    """
+    # No-LLM stub: always return empty string (== "no objection")
+    return ""
+
+
+# 保留 reflect() 作为 _stub_reflect 的兼容别名（v5.0 文档中曾用此名）
+def reflect(field_label: str, field_value, context: dict) -> str:
+    """_stub_reflect 的兼容别名；context 是包含 filled_so_far 的 dict。"""
+    return _stub_reflect(field_label, field_value, context.get("filled_so_far", {}))
+
+
+# ---------------------------------------------------------------------------
+# v5.0 新增：profile.md 中间产物生成（R1-A2 / Pattern D）
+# ---------------------------------------------------------------------------
+
+def write_profile_md(profiles: dict, out_dir: str, profiles_dir: str = None) -> str:
+    """
+    将 profiles dict 扁平化为人类可读的 markdown spec，写到 out_dir 下：
+      - profile_v{N}.md   （N 由 profiles_dir/.profile_counter 持久化，默认 N=1）
+      - profile.md        （覆盖为最新版本的拷贝）
+
+    profiles_dir 仅用于读取/递增版本计数器（profiles/.profile_counter），
+    不会写入任何 profile.md 派生产物 —— 派生产物与输出 DOCX 同目录，
+    避免污染 git-trackable 的 profiles/ 目录。
+
+    返回正文（不含 frontmatter）的 8 字符 SHA-256 校验和，供 Step 2.5 / Step 5.5
+    的 prompt 中引用。
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # 决定下一个版本号：使用 profiles_dir/.profile_counter 文件持久化
+    counter_dir = Path(profiles_dir) if profiles_dir else out_path
+    counter_file = counter_dir / ".profile_counter"
+    if counter_file.exists():
+        try:
+            next_n = int(counter_file.read_text(encoding="utf-8").strip()) + 1
+        except (ValueError, OSError):
+            next_n = 1
+    else:
+        # 默认 N=1（首次运行），并把计数器写到 counter_dir
+        next_n = 1
+    try:
+        counter_dir.mkdir(parents=True, exist_ok=True)
+        counter_file.write_text(str(next_n), encoding="utf-8")
+    except OSError:
+        # 若 counter 目录不可写，忽略（不阻塞主流程）
+        pass
+
+    versioned = out_path / f"profile_v{next_n}.md"
+    stable = out_path / "profile.md"
+
+    # 拼装 markdown 正文
+    personal = profiles.get("personal", {}) or {}
+    contact = profiles.get("contact", {}) or {}
+    education_entries = (profiles.get("education", {}) or {}).get("entries", []) or []
+    league = profiles.get("league", {}) or {}
+
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        "# Profile Spec (v{0}) — generated {1}".format(next_n, ts),
+        "> DO NOT CONTRADICT — 后续所有 Step 3–8 prompt 必须以本文档为事实源。",
+        "",
+        "## Identity",
+        f"- 姓名 (zh): {personal.get('name') or '<未填>'}",
+        f"- 姓名 (拼音占位): {personal.get('name_pinyin') or '<待填>'}",
+        f"- 姓名 (English 占位): {personal.get('name_en') or '<待填>'}",
+        f"- 性别: {personal.get('gender') or '<未填>'}",
+        f"- 出生日期: {personal.get('birth_date') or '<未填>'}",
+        f"- 籍贯: {personal.get('birthplace') or '<未填>'}",
+        f"- 民族: {personal.get('ethnicity') or '<未填>'}",
+        f"- 政治面貌: {personal.get('political_status') or '<未填>'}",
+        "",
+        "## Contact",
+        f"- 手机: {contact.get('phone') or '<未填>'}",
+        f"- 邮箱: {contact.get('email') or '<未填>'}",
+        "",
+        "## Education (entries[])",
+        "| # | 学校 | 院系 | 专业 | 学位 | 入学 | 学号 |",
+        "|---|------|------|------|------|------|------|",
+    ]
+    for i, e in enumerate(education_entries, 1):
+        lines.append(
+            f"| {i} | {e.get('school') or '<未填>'} | {e.get('department') or '<未填>'} | "
+            f"{e.get('major') or '<未填>'} | {e.get('degree') or '<未填>'} | "
+            f"{e.get('start_date') or '<未填>'} | {e.get('student_id') or '<未填>'} |"
+        )
+    lines += [
+        "",
+        "## League / Party",
+        f"- 政治面貌 (personal): {personal.get('political_status') or '<未填>'}",
+        f"- 团内职务: {league.get('league_position') or '<未填>'}",
+        f"- 党员状态: {league.get('party_status') or '<未填>'}",
+        f"- 评议等级: {league.get('league_evaluation') or '<未填>'}",
+        f"- 入团日期: {league.get('league_join_date') or '<未填>'}",
+        "",
+        "## Checksum",
+        "SHA-256(正文) = {0}",
+        "",
+    ]
+
+    body = "\n".join(lines)
+    # 用占位符写一次拿到 SHA，然后回填
+    placeholder = "0" * 8
+    body_for_hash = body.replace("{0}", placeholder, 1)
+    digest = hashlib.sha256(body_for_hash.encode("utf-8")).hexdigest()[:8]
+    final_body = body.replace("{0}", digest, 1)
+
+    versioned.write_text(final_body, encoding="utf-8")
+    stable.write_text(final_body, encoding="utf-8")
+    return digest
+
+
+# ---------------------------------------------------------------------------
+# v5.0 新增：填写对照表渲染（R1-A3）
+# ---------------------------------------------------------------------------
+
+def render_audit_table(audit: dict, template_path: str, out_path: str) -> None:
+    """
+    读取 templates/audit_table.md，把 [占位符] 替换为 audit 数据，写到 out_path。
+    复用的图标：✅ 🔄 ⚠️ 📝 ❌ 📎
+    """
+    tpl = Path(template_path).read_text(encoding="utf-8")
+
+    # 字段详情行
+    rows = []
+    counts = {"✅": 0, "🔄": 0, "📝": 0, "⚠️": 0, "❌": 0, "📎": 0}
+    missing_list = []
+    ai_list = []
+    for i, item in enumerate(audit.get("details", []), 1):
+        status = item.get("status", "❓")
+        counts[status] = counts.get(status, 0) + 1
+        label = item.get("label", "")
+        value = item.get("value", "")
+        source = item.get("source", "")
+        reflection = item.get("reflection", "") or "—"
+        rows.append(
+            f"| {i} | {label} | {value} | {source} | {status} | {reflection} |"
+        )
+        if status == "❌":
+            missing_list.append(f"- {label}（{source}）")
+        if status == "📝":
+            ai_list.append(f"- {label}（约 {len(str(value))} 字）")
+
+    total = sum(counts.values()) or 1
+    pct = lambda n: f"{int(n / total * 100)}%"
+
+    # 状态统计行
+    stats_rows = [
+        f"| ✅ 自动匹配 | {counts.get('✅', 0)} | {pct(counts.get('✅', 0))} |",
+        f"| 🔄 推断填充 | {counts.get('🔄', 0)} | {pct(counts.get('🔄', 0))} |",
+        f"| 📝 AI 生成 | {counts.get('📝', 0)} | {pct(counts.get('📝', 0))} |",
+        f"| ⚠️ 模糊/反思警告 | {counts.get('⚠️', 0)} | {pct(counts.get('⚠️', 0))} |",
+        f"| ❌ 缺失 | {counts.get('❌', 0)} | {pct(counts.get('❌', 0))} |",
+    ]
+
+    # 待补充字段
+    missing_block = "\n".join(missing_list) if missing_list else "（无）"
+    # AI 生成内容
+    ai_block = "\n".join(ai_list) if ai_list else "（无）"
+
+    today = audit.get("date") or "未知"
+    table_name = audit.get("table_name") or "未指定"
+    input_fmt = audit.get("input_format") or "DOCX"
+    info_source = audit.get("info_source") or "（无）"
+    attachments_n = audit.get("attachments", 0)
+
+    replacements = {
+        "[表格名称]": table_name,
+        "[YYYY-MM-DD]": today,
+        "[DOCX / Excel / PDF / 文字描述]": input_fmt,
+        "[信息源文件名（如有）]": info_source,
+        "[N] 个": f"{attachments_n} 个",
+        "[逐条列出缺失字段，附推测值（如有）]": missing_block,
+        "[逐条列出 AI 生成内容，附字数统计]": ai_block,
+        "[文件名] | [附件类型] | [AI 生成 / 用户提供 / 待准备]": "（无附件） | — | —",
+    }
+
+    out = tpl
+    for k, v in replacements.items():
+        out = out.replace(k, str(v))
+
+    # 替换示例行（`| 1 | [字段名] | ...`）为真实行
+    out = re.sub(
+        r"\|\s*1\s*\|\s*`?\[字段名\]`?\s*\|\s*`?\[填入值\]`?\s*\|\s*`?\[配置文件路径\]`?\s*\|\s*✅\s*\|\s*`?\[反思（≤2 句）或 — \]`?\s*\|",
+        "\n".join(rows) if rows else "| 1 | — | — | — | — | — |",
+        out,
+        count=1,
+    )
+    # 替换 `...` 占位行（紧跟在字段行下面的省略行）
+    out = re.sub(r"\|\s*\.\.\.\s*\|\s*\.\.\.\s*\|\s*\.\.\.\s*\|\s*\.\.\.\s*\|\s*\.\.\.\s*\|\s*\.\.\.\s*\|", "", out, count=1)
+
+    # 替换状态统计的占位行
+    out = re.sub(
+        r"\|\s*✅\s*自动匹配\s*\|\s*`?\[N\]`?\s*\|\s*`?\[X%\]`?\s*\|",
+        stats_rows[0], out, count=1
+    )
+    out = re.sub(
+        r"\|\s*🔄\s*推断填充\s*\|\s*`?\[N\]`?\s*\|\s*`?\[X%\]`?\s*\|",
+        stats_rows[1], out, count=1
+    )
+    out = re.sub(
+        r"\|\s*📝\s*AI 生成\s*\|\s*`?\[N\]`?\s*\|\s*`?\[X%\]`?\s*\|",
+        stats_rows[2], out, count=1
+    )
+    out = re.sub(
+        r"\|\s*❌\s*缺失\s*\|\s*`?\[N\]`?\s*\|\s*`?\[X%\]`?\s*\|",
+        stats_rows[4], out, count=1
+    )
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(out, encoding="utf-8")
+
+
 def count_chinese_chars(text: str) -> int:
     """统计中文字符数（不含标点和空格）"""
     return len(re.findall(r'[\u4e00-\u9fff]', text))
 
 
 def truncate_to_limit(content: str, max_chars: int) -> str:
-    """按字数限制截断，保留完整句子"""
+    """按句子截断，保留完整句子"""
     if count_chinese_chars(content) <= max_chars:
         return content
     sentences = re.split(r'([。！？；])', content)
@@ -213,17 +456,41 @@ def truncate_to_limit(content: str, max_chars: int) -> str:
     return result
 
 
-def fill_docx(template_path: str, profiles: dict, output_path: str) -> dict:
+def fill_docx(template_path: str, profiles: dict, output_path: str,
+              reflexion_rounds: int = 0,
+              profile_md_dir: str = None,
+              profile_counter_dir: str = None,
+              _reflect_impl=None) -> dict:
     """
     填写 DOCX 表格：
     1. 遍历所有表格的标签单元格
     2. 语义匹配 → 找到配置值
     3. 填入相邻的值单元格
     4. 处理合并单元格
-    5. 保存结果
+    5. 可选：对每个填入字段调用 _stub_reflect() 做自检反思
+    6. 保存结果
+
+    reflexion_rounds: 自检反思轮数（0 = 关闭，1 = 默认）。每轮会调用 _stub_reflect()，
+                      反思非空则把反思写入 audit entry 并把状态降级为 ⚠️。
+    profile_md_dir: 若提供，则调用 write_profile_md() 把 profile.md 写到该目录
+                    （默认建议 = output DOCX 同目录，避免污染 profiles/）。
+    profile_counter_dir: 计数器文件目录（默认 profiles/），仅持久化版本号 N。
+    _reflect_impl: 可选，注入测试替身；缺省使用 _stub_reflect。
     """
+    if profile_md_dir:
+        try:
+            sha = write_profile_md(
+                profiles,
+                profile_md_dir,
+                profiles_dir=profile_counter_dir,
+            )
+            print(f"📝 已生成 profile.md (SHA {sha})")
+        except Exception as exc:
+            print(f"⚠️ profile.md 生成失败: {exc}")
+
     doc = Document(template_path)
     audit = {"filled": 0, "missed": 0, "inferred": 0, "details": []}
+    reflect_fn = _reflect_impl if _reflect_impl is not None else _stub_reflect
 
     for table in doc.tables:
         seen_cells = set()
@@ -248,6 +515,7 @@ def fill_docx(template_path: str, profiles: dict, output_path: str) -> dict:
 
                 # 找相邻单元格填入值
                 value_cell = _find_value_cell(table, ri, ci, seen_cells)
+                filled_value = None
                 if value_cell and result["value"]:
                     # 清空原有内容
                     for p in value_cell.paragraphs:
@@ -255,21 +523,42 @@ def fill_docx(template_path: str, profiles: dict, output_path: str) -> dict:
                             run.text = ""
                     if value_cell.paragraphs:
                         value_cell.paragraphs[0].text = str(result["value"])
+                    filled_value = result["value"]
+                    status_icon = "✅"
+                else:
+                    status_icon = "❌"
 
+                # Step 5.5 自检反思（plumbing-only stub，可注入测试替身）
+                reflection_text = ""
+                if reflexion_rounds > 0 and filled_value:
+                    filled_so_far = {
+                        d["label"]: d["value"] for d in audit["details"] if d.get("value")
+                    }
+                    for _ in range(reflexion_rounds):
+                        r = reflect_fn(text, filled_value, filled_so_far)
+                        if not r:
+                            break  # stub: nothing to reflect on
+                        reflection_text = r
+                        status_icon = "⚠️"
+                        filled_so_far[text] = filled_value
+
+                if filled_value:
                     audit["filled"] += 1
                     audit["details"].append({
                         "label": text,
-                        "value": result["value"],
+                        "value": filled_value,
                         "source": f"{result['config_file']}.yaml",
-                        "status": result["status"],
+                        "status": status_icon,
+                        "reflection": reflection_text,
                     })
-                elif not result["value"]:
+                else:
                     audit["missed"] += 1
                     audit["details"].append({
                         "label": text,
                         "value": "",
                         "source": f"{result['config_file']}.yaml (缺失)",
                         "status": "❌",
+                        "reflection": "",
                     })
 
     # 保存
@@ -298,7 +587,7 @@ def _find_value_cell(table, label_row: int, label_col: int, seen_cells: set):
 
 
 def print_audit(audit: dict):
-    """打印填写对照表"""
+    """打印填写对照表（含自检反思列）"""
     print("\n" + "=" * 60)
     print("📋 填写对照表")
     print("=" * 60)
@@ -306,7 +595,9 @@ def print_audit(audit: dict):
     print("-" * 60)
 
     for item in audit["details"]:
-        print(f"  {item['status']} {item['label']}: {item['value']} ({item['source']})")
+        refl = item.get("reflection", "")
+        suffix = f"  ↪ {refl}" if refl else ""
+        print(f"  {item['status']} {item['label']}: {item['value']} ({item['source']}){suffix}")
 
     total = audit["filled"] + audit["missed"]
     if total > 0:
@@ -315,11 +606,21 @@ def print_audit(audit: dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DOCX 表格填写工具")
+    parser = argparse.ArgumentParser(description="DOCX 表格填写工具 (form-filler v5.0)")
     parser.add_argument("--template", required=True, help="DOCX 模板文件路径")
     parser.add_argument("--profile-dir", default="./profiles", help="配置文件目录")
     parser.add_argument("--output", default=None, help="输出文件路径")
     parser.add_argument("--scan-only", action="store_true", help="仅扫描不填写")
+    parser.add_argument("--reflexion-rounds", type=int, default=0,
+                        help="v5.0 Reflexion 自检反思轮数（默认 0 = 关闭，1 = 推荐）")
+    parser.add_argument("--audit-out", default=None,
+                        help="v5.0 填写对照表输出路径（默认 {output_basename}_audit.md）")
+    parser.add_argument("--audit-template", default="templates/audit_table.md",
+                        help="v5.0 对照表模板路径")
+    parser.add_argument("--write-profile", action="store_true",
+                        help="v5.0 先生成 profile.md 中间产物，再填写")
+    parser.add_argument("--table-name", default=None,
+                        help="v5.0 写入对照表的「表格名称」字段")
 
     args = parser.parse_args()
 
@@ -341,8 +642,27 @@ def main():
     # 填写
     output = args.output or args.template.replace(".docx", "_已填写.docx")
     print(f"\n✍️ 开始填写...")
-    audit = fill_docx(args.template, profiles, output)
+    # profile.md 写到 output DOCX 同目录，计数器仍在 profiles/ 里
+    profile_md_dir = str(Path(output).parent) if args.write_profile else None
+    profile_counter_dir = args.profile_dir
+    audit = fill_docx(args.template, profiles, output,
+                      reflexion_rounds=args.reflexion_rounds,
+                      profile_md_dir=profile_md_dir,
+                      profile_counter_dir=profile_counter_dir)
     print_audit(audit)
+
+    # v5.0: 写入 audit.md 文件
+    audit_path = args.audit_out or (str(Path(output).with_suffix("")) + "_audit.md")
+    try:
+        audit["table_name"] = args.table_name or Path(args.template).stem
+        audit["date"] = __import__("datetime").date.today().isoformat()
+        audit["input_format"] = "DOCX"
+        audit["info_source"] = "（无）"
+        audit["attachments"] = 0
+        render_audit_table(audit, args.audit_template, audit_path)
+        print(f"📋 已写入对照表: {audit_path}")
+    except Exception as exc:
+        print(f"⚠️ 对照表写入失败: {exc}")
 
 
 if __name__ == "__main__":

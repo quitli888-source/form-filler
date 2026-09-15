@@ -1,7 +1,7 @@
 ---
 name: form-filler
-version: "4.0"
-description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
+version: "5.0"
+description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check, reflexion, profile.md spec, audit table render, score harness. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
 metadata:
   openclaw:
     always: false
@@ -244,6 +244,81 @@ form-filler/
 4. 缺失标记 → 进入 Step 4 询问
 ```
 
+### Step 2.5: 生成 profile.md 中间产物
+
+> 这是 v4.1 新增的关键中间产物（Pattern D / shared_dependencies 模式）。目的：把分散在各 YAML 中的字段聚合成一个**人类可读的、版本化的、不可被后续 prompt 漂移**的统一事实源。
+
+**何时生成**：每次 Step 2A / 2B 成功完成（字段映射完成、合并冲突已解决）后，**立即**生成。
+
+**产物**：
+
+```
+profiles/
+├── profile.md          ← 稳定符号链接（或拷贝），永远指向最新版本
+├── profile_v0.md       ← 第一次生成（基线）
+├── profile_v1.md       ← 第二次生成
+└── profile_v{N}.md     ← 第 N 次生成（N 从 0 起，按已有文件数递增）
+```
+
+**内容结构**（`profile.md` 必须按此顺序呈现）：
+
+```markdown
+# Profile Spec (v{N}) — generated {YYYY-MM-DD HH:MM}
+> SHA-256 (8 chars): {xxxxxxxx}
+
+## DO NOT CONTRADICT
+> 后续所有 prompt（Step 3–8）必须以本文档为事实源，不得引入与本文档不一致的事实。
+
+## Identity
+- 姓名 (zh): {{personal.name}}
+- 姓名 (拼音占位): {{personal.name_pinyin or "<待填>"}}
+- 姓名 (English 占位): {{personal.name_en or "<待填>"}}
+- 性别: {{personal.gender}}
+- 出生日期: {{personal.birth_date}}
+- 籍贯: {{personal.birthplace}}
+- 民族: {{personal.ethnicity or "<未填>"}}
+- 政治面貌: {{personal.political_status}}
+
+## Contact
+- 手机: {{contact.phone}}
+- 邮箱: {{contact.email}}
+- 现地址: {{contact.current_address.*}}
+
+## Education (entries[])
+| # | 学校 | 院系 | 专业 | 学位 | 入学 | 学号 |
+|---|------|------|------|------|------|------|
+| 1 | ... | ... | ... | ... | ... | ... |
+
+## League / Party
+- 团内职务 / 党员状态: ...
+
+## Awards / Work / Publications
+（按 YAML 原样摘要列出，保留条目数）
+
+## Checksum
+SHA-256(正文) = {xxxxxxxx}
+```
+
+**关键规则**：
+
+1. **每个字段标注来源**：`personal.name` 这种点分路径直接写在值旁边，便于追溯。
+2. **空字段保留为 `<未填>`** 而不是删除——避免后续 prompt 因找不到字段而重新生成。
+3. **`DO NOT CONTRADICT` 段必须位于最顶部**——后续所有 Step 3–8 的 prompt 模板第一行必须是「`@profile.md` 优先，任何与此文件矛盾的字段值视为错误」。
+4. **生成时机**：Step 2A/2B 完成 → 立即调用 `scripts/fill_docx.py --write-profile` 或 `write_profile_md(profiles, out_dir)`。若用户跳过 Step 2A/2B（如模板替换场景），仍需先生成 `profile.md`。
+5. **审计表关联**：填写对照表的「数据来源」列从此指向 `profile.md` 而非 `personal.yaml`，但保留 `personal.yaml` 作为底层 source-of-truth。
+
+**引用约定**（Anti-pattern 2 缓解）：
+
+后续 Step 3–8 的 prompt 模板顶部固定使用以下开头：
+
+```
+# @profile.md 是事实源。任何与此文件矛盾的字段值视为错误。
+# 当前 profile.md 版本：profile_v{N}.md (SHA {xxxxxxxx})
+[...具体的 prompt 内容...]
+```
+
+避免把整个 800 行的 SKILL.md / 全部 YAML 拼进每个 prompt。
+
 ### Step 3: 多条目选择（工作经历/获奖/论文等）
 
 当匹配到配置中的列表型字段（如 `awards.entries[]`）时，按以下策略智能选择：
@@ -328,6 +403,49 @@ for each 缺失字段:
 - 自荐信/个人陈述：语气正式但不僵硬，避免套话，突出个人特色
 - 理解/看法类：控制在字数限制的 90-100%，条理清晰
 - 简历：时间倒序，信息完整无冗余
+
+### Step 5.5: 自检反思（Reflexion）
+
+> v4.1 新增（Pattern C / Reflexion 模式）。目的：在填写对照表（Step 7）的「阻断级」一致性校验之前，先由模型对**每一个已生成字段**做一次轻量自检，把矛盾 / 超限 / 幻觉当场拦下，避免污染下游。
+
+**触发**：每个字段生成完成（Step 5）、准备提交到对照表之前。
+
+**单次反思调用模板**：
+
+```
+# @profile.md 是事实源。任何与此文件矛盾的字段值视为错误。
+# 当前 profile.md 版本：profile_v{N}.md (SHA {xxxxxxxx})
+
+## 已填字段
+- 字段名: {label}
+- 当前填入值: {value}
+- 字段字数/格式限制: {如有, max_chars / regex / enum}
+- 同表已填字段(供交叉对比):
+  {for k, v in filled_so_far.items(): "- {k}: {v}"}
+
+## 你的任务（最多 2 句话回答）
+1. 这个值是否与其他已填字段矛盾？(例：年龄段 vs 学历、政治面貌 vs 申报类别、姓名拼音 vs 中文姓名)
+2. 这个值是否违反字数 / 格式限制（如字数超限、手机号非 11 位、邮箱无 @）？
+3. 这个值是否包含无法在 profile.md 找到的数字 / 名称（潜在幻觉）？
+
+回答格式：简短陈述句。若一切正常，回 "OK"；否则回 "<问题描述>"。
+```
+
+**反思结果处理**：
+
+| 反思结果 | 行为 |
+|---------|------|
+| `OK` 或空字符串 | 提交到对照表，状态 `✅` / `📝`（取决于是否 AI 生成） |
+| 非空陈述（发现问题） | 状态标记 `⚠️` 并把反思原文写入对照表的「自检反思」列；**且**重新调用 Step 5 用反思作为额外上下文重生成一次（仅 1 次重试） |
+| 重试后仍有问题 | 保留 `⚠️` + 反思，提交给用户在 Step 7.5 阻断决策中处理 |
+
+**反思写入对照表**：`templates/audit_table.md` 的字段详情表新增 `自检反思` 列，1–2 句陈述句或 `—`。
+
+**CLI 控制**：反思轮数通过 `--reflexion-rounds N` 控制（默认 1，最大建议 2）。`N=0` 等同关闭反思，行为退回 v4.0。脚本实现：`scripts/fill_docx.py` 暴露 `reflect(field_label, field_value, context) -> str`，无 LLM 时返回 `""`（plumbing-only stub），不阻塞端到端流程。
+
+**与 Step 7.5 的关系**：Step 5.5 是「填写时」反思（per-field），Step 7.5 是「提交前」整表校验（cross-field）。两者互补，不重复——5.5 拦的是单字段自相矛盾，7.5 拦的是跨字段 / 表级硬规则。
+
+**与 profile.md 的关系**：反思调用必须包含 `@profile.md` 的 SHA + 已填字段摘要，确保模型有 ground truth 可对照，避免产生「反思幻觉」。
 
 ### Step 6: 处理附件需求
 

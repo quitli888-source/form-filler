@@ -2,6 +2,12 @@
 # profiles/ 目录包含用户个人信息，切勿分享或提交到版本控制
 profiles/*.yaml
 profiles/*.yml
+# v4.1 profile.md 中间产物（含 PII 的衍生 spec，禁止提交）
+profiles/profile.md
+profiles/profile_v*.md
+# v4.1 audit.md 对照表（可能含敏感填入值，禁止提交）
+profiles/_audit.md
+*_audit.md
 
 # 系统文件
 .DS_Store
@@ -11,3 +17,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 .venv/
+
+# v5.0 内部状态文件
+profiles/.profile_counter
