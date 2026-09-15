@@ -1,13 +1,13 @@
 ---
 name: form-filler
-version: "5.0"
-description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check, reflexion, profile.md spec, audit table render, score harness. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
+version: "6.0"
+description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check, reflexion, profile.md spec, audit table render, score harness, Pydantic schema-as-prompt, provider-agnostic LLM adapter. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
 metadata:
   openclaw:
     always: false
   i18n:
-    zh: "通用智能填表助手。支持 DOCX/Excel/PDF 等格式表格自动填写，含 OCR、AI 内容生成、信息源深度挖掘、一致性校验、缺失字段迭代收集"
-    en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/image forms from user profile, with OCR, AI content generation, deep source mining, consistency validation, and progressive info collection."
+    zh: "通用智能填表助手。支持 DOCX/Excel/PDF 等格式表格自动填写，含 OCR、AI 内容生成、信息源深度挖掘、一致性校验、缺失字段迭代收集、Pydantic schema-as-prompt、provider-agnostic LLM adapter"
+    en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/image forms from user profile, with OCR, AI content generation, deep source mining, consistency validation, progressive info collection, Pydantic schema-as-prompt, and provider-agnostic LLM adapter."
 ---
 
 # 智能填表助手（Form Filler）
@@ -409,7 +409,9 @@ for each 缺失字段:
 
 ### Step 5.5: 自检反思（Reflexion）
 
-> v4.1 新增（Pattern C / Reflexion 模式）。目的：在填写对照表（Step 7）的「阻断级」一致性校验之前，先由模型对**每一个已生成字段**做一次轻量自检，把矛盾 / 超限 / 幻觉当场拦下，避免污染下游。
+> v4.1 新增（Pattern C / Reflexion 模式），v6.0 升级：走 **Model Adapter**（Pattern F2）—— 默认 `stub` 保持离线，启用 `--provider openai-compatible` 后调用真实 LLM。
+
+目的：在填写对照表（Step 7）的「阻断级」一致性校验之前，先由模型对**每一个已生成字段**做一次轻量自检，把矛盾 / 超限 / 幻觉当场拦下，避免污染下游。
 
 **触发**：每个字段生成完成（Step 5）、准备提交到对照表之前。
 
@@ -444,11 +446,63 @@ for each 缺失字段:
 
 **反思写入对照表**：`templates/audit_table.md` 的字段详情表新增 `自检反思` 列，1–2 句陈述句或 `—`。
 
-**CLI 控制**：反思轮数通过 `--reflexion-rounds N` 控制（默认 1，最大建议 2）。`N=0` 等同关闭反思，行为退回 v4.0。脚本实现：`scripts/fill_docx.py` 暴露 `reflect(field_label, field_value, context) -> str`，无 LLM 时返回 `""`（plumbing-only stub），不阻塞端到端流程。
+**CLI 控制**：反思轮数通过 `--reflexion-rounds N` 控制（默认 0 = 关闭，1 = 推荐）。脚本实现：`scripts/fill_docx.py` 暴露 `reflect(field_label, field_value, context) -> str`，无 LLM 时通过 `ModelAdapter` 抽象的 `StubAdapter` 返回 `""`，不阻塞端到端流程。启用真实 LLM 见 [Step 5A Schema-constrained 路径](#step-5a-schema-constrained-路径v60-新增)。
 
 **与 Step 7.5 的关系**：Step 5.5 是「填写时」反思（per-field），Step 7.5 是「提交前」整表校验（cross-field）。两者互补，不重复——5.5 拦的是单字段自相矛盾，7.5 拦的是跨字段 / 表级硬规则。
 
 **与 profile.md 的关系**：反思调用必须包含 `@profile.md` 的 SHA + 已填字段摘要，确保模型有 ground truth 可对照，避免产生「反思幻觉」。
+
+#### Step 5A: Schema-constrained 路径（v6.0 新增）
+
+> Pattern A2（来源 jxnl/instructor + dottxt-ai/outlines）：当字段类型在 `evaluation/schemas.py` 中存在 Pydantic 模型时，把约束作为 `response_model` 直接传给 LLM，模型**物理上**无法生成违反约束的值。R8（字数超限）、R4（手机格式）、R5（邮箱格式）从「运行时检测」升级为「编译时不可能」。
+
+**触发条件**：字段状态为 `📝`（AI 生成）**且** `evaluation/schemas.py` 中存在以该字段命名的 Pydantic Field。
+
+**示例**：
+
+```python
+# evaluation/schemas.py 内置 3 套模板：
+#   - 优秀团员申报表 (class 优秀团员申报表(BaseModel))
+#   - 奖学金申请表 (class 奖学金申请表(BaseModel))
+#   - 个人简历 (class 个人简历(BaseModel))
+
+# 字段「自荐信」匹配 schemas.优秀团员申报表.自荐信
+#   → Field(min_length=200, max_length=800) 强制字数约束
+# LLM 不可能返回 100 字或 1000 字。
+```
+
+**降级路径**：若 `instructor` 未安装或 schema 不匹配，Step 5A 静默回退到原 Step 5（自由 prompt）。**默认行为对未启用 `--provider openai-compatible` 的用户完全无变化。**
+
+**Model Adapter 选择**：
+
+| Provider | `--provider` | 何时使用 |
+|----------|--------------|----------|
+| `stub`（默认） | `stub` | CI / 演示 / 无 LLM 场景。反射返回 ""。**v5.0 行为完全保留。** |
+| 任何 OpenAI 兼容 endpoint | `openai-compatible` | OpenAI / DeepSeek / minimax m3 / Qwen / Moonshot / Zhipu / 任何 OpenAI Chat Completions 兼容服务 |
+
+**启用真实 LLM 示例**（以 minimax m3 为例）：
+
+```bash
+export LLM_BASE_URL="https://api.minimax.chat/v1"
+export LLM_API_KEY="sk-cp-31aRiPSl8Kd90CfNjhsXwRUHB6kIBEA0IY79AdNBpUCN8vGZRhrnIFjhZ3l_Ed6WWN3stdNo6dEw4_J5SCtTzHSr5VSMvQrRU8ntMKRaOADHGtlQWGTxeAA"
+export LLM_MODEL_NAME="MiniMax-M3"
+
+python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx \
+    --provider openai-compatible --reflexion-rounds 1
+```
+
+或完全用 CLI 参数覆盖：
+
+```bash
+python fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx \
+    --provider openai-compatible \
+    --llm-base-url "https://api.minimax.chat/v1" \
+    --llm-api-key "sk-cp-..." \
+    --llm-model-name "MiniMax-M3" \
+    --reflexion-rounds 1
+```
+
+**隐私保护**：PII 字段（手机/邮箱/身份证/银行卡）在写入 `audit.md` 前自动脱敏为 `138****5678` / `***@example.com` / `110101********1234`。详见 `scripts/fill_docx.py:_redact()`。
 
 ### Step 6: 处理附件需求
 

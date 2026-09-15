@@ -1,0 +1,20 @@
+# form-filler v6.0 — Python dependencies
+# Install all: pip install -r requirements.txt
+# Install core only (v5.0-compatible, no LLM): pip install -r requirements.txt --no-deps
+
+# ----- Core (required) -----
+python-docx>=1.0          # DOCX 读写（fill_docx.py 主依赖）
+pyyaml>=6.0               # YAML 配置文件读写
+
+# ----- Optional: LLM + schema-as-prompt (v6.0) -----
+# 启用真实 LLM 自检反思 / Schema 约束生成时安装。
+# 未安装时 fill_docx.py 自动降级到 v5.0 行为（StubAdapter）。
+pydantic>=2.0             # 字段约束类型系统
+openai>=1.0,<2.0          # OpenAI 兼容 SDK（covers OpenAI / minimax m3 / DeepSeek / Qwen ...）
+instructor>=1.0           # Pydantic-validated structured outputs
+
+# ----- Optional: PDF / OCR / Excel (per SKILL.md §工具集成指南) -----
+# openpyxl
+# PyMuPDF
+# pdf2image
+# rapidocr-onnxruntime
