@@ -220,6 +220,72 @@ class TestFillDocxEnd2End(unittest.TestCase):
         self.assertEqual(warn_count, 0,
                          f"StubAdapter 反射空字符串，不应触发 ⚠️: {audit}")
 
+    def test_simple_docx_three_fields(self):
+        """R3-A2 fix (Pattern D2): simple.docx 现在应该填满全部 3 个 label，
+        而不是之前因为 diagonal merged cells 漏掉 1 个。"""
+        out = self.out_dir / "filled.docx"
+        audit = fill_docx(
+            str(self.FIXTURE), self.PROFILE, str(out),
+            adapter=StubAdapter(),
+        )
+        self.assertEqual(audit["filled"], 3,
+                         f"R3-A2 fix: 应填满 3 个字段，实际 {audit['filled']}: {audit}")
+        filled_labels = [d["label"] for d in audit["details"] if d["value"]]
+        self.assertEqual(set(filled_labels), {"姓名", "性别", "学号"})
+
+
+class TestSchemaFirstRouting(unittest.TestCase):
+    """v6.1 R3-A1 (Pattern A3): schema-first routing 修复 first-match-wins."""
+
+    PROFILE = {
+        "personal": {"name": "张三", "gender": "男"},
+        "contact": {"phone": "13812345678", "email": "z@example.com"},
+        "education": {"entries": [{
+            "school": "ZJU", "department": "CS", "major": "计算机科学",
+            "degree": "本科", "student_id": "12345678", "start_date": "2024-09",
+        }]},
+    }
+
+    def test_学历专业_resolves_to_专业(self):
+        """R3-A1 修复：'学历专业' 不再匹配 first regex '学历|年级'，
+        而是 schema-first 路由到 '专业' 字段。"""
+        r = match_field("学历专业", self.PROFILE)
+        self.assertTrue(r["matched"])
+        # 应该路由到 专业 而非 学历|年级
+        self.assertEqual(r["field_path"], "专业",
+                         f"R3-A1: 应路由到 '专业' 字段，实际 '{r['field_path']}'")
+        self.assertEqual(r["value"], "计算机科学")
+        self.assertEqual(r["schema"], "优秀团员申报表")
+
+    def test_专业_direct_match(self):
+        """'专业' 直接匹配 schema '优秀团员申报表.专业' 字段"""
+        r = match_field("专业", self.PROFILE)
+        self.assertTrue(r["matched"])
+        self.assertEqual(r["field_path"], "专业")
+        self.assertEqual(r["value"], "计算机科学")
+
+    def test_实习岗位_routes_to_internship_schema(self):
+        """'实习岗位' 路由到 实习鉴定表 schema"""
+        r = match_field("实习岗位", self.PROFILE)
+        self.assertTrue(r["matched"])
+        self.assertEqual(r["schema"], "实习鉴定表")
+        # 没有实习单位配置 → value is None
+        self.assertIsNone(r["value"])
+
+    def test_论文题目_routes_to_thesis_schema(self):
+        """'论文题目' 路由到 学位论文申请表 schema"""
+        r = match_field("论文题目", self.PROFILE)
+        self.assertTrue(r["matched"])
+        self.assertEqual(r["schema"], "学位论文申请表")
+
+    def test_unknown_label_falls_back_to_regex(self):
+        """完全不在 schema 里的 label 应该回退到 match_rules 正则"""
+        # '邮箱' 是 schema 字段，会走 schema-first → 命中
+        r = match_field("邮箱", self.PROFILE)
+        self.assertTrue(r["matched"])
+        # value 通过 _lookup_profile_field 找 contact.email → "z@example.com"
+        self.assertEqual(r["value"], "z@example.com")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

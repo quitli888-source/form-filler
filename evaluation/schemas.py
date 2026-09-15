@@ -104,24 +104,134 @@ class 个人简历(BaseModel):
     )
 
 
+# ---- Schema 4: 入党申请书 (v6.1, R3-A4) ------------------------------------
+class 入党申请书(BaseModel):
+    """入党申请书 / 入党积极分子登记表 (示例：高校入党流程)"""
+    姓名: str = Field(min_length=2, max_length=20)
+    性别: Literal["男", "女"]
+    出生年月: str = Field(pattern=r"^\d{4}-\d{2}$", description="YYYY-MM")
+    籍贯: str = Field(min_length=2, max_length=30)
+    民族: str = Field(default="汉族", min_length=2, max_length=10)
+    政治面貌: Literal["共青团员", "入党积极分子", "群众"]
+    申请日期: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$", description="YYYY-MM-DD")
+    入党动机: str = Field(
+        min_length=200, max_length=800,
+        description="AI 生成，200–800 中文字符",
+    )
+
+
+# ---- Schema 5: 学位论文申请表 (v6.1, R3-A4) -------------------------------
+class 学位论文申请表(BaseModel):
+    """硕士 / 博士学位论文答辩申请表"""
+    姓名: str = Field(min_length=2, max_length=20)
+    学号: str = Field(pattern=STUDENT_ID_RE)
+    院系: str = Field(min_length=2, max_length=40)
+    专业: str = Field(min_length=2, max_length=40)
+    学位: Literal["硕士", "博士"]
+    导师: str = Field(min_length=2, max_length=20, description="指导教师姓名")
+    论文题目: str = Field(min_length=4, max_length=100, description="完整论文题目")
+    答辩日期: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$", description="YYYY-MM-DD")
+    创新点摘要: str = Field(
+        min_length=300, max_length=1000,
+        description="AI 生成，300–1000 字",
+    )
+
+
+# ---- Schema 6: 实习鉴定表 (v6.1, R3-A4) -----------------------------------
+class 实习鉴定表(BaseModel):
+    """毕业实习鉴定表 / 单位实习考核表"""
+    姓名: str = Field(min_length=2, max_length=20)
+    学号: str = Field(pattern=STUDENT_ID_RE)
+    院系: str = Field(min_length=2, max_length=40)
+    专业: str = Field(min_length=2, max_length=40)
+    实习单位: str = Field(min_length=2, max_length=60)
+    实习岗位: str = Field(min_length=2, max_length=30)
+    实习起止: str = Field(pattern=r"^\d{4}-\d{2}\s*至\s*\d{4}-\d{2}$",
+                         description="YYYY-MM 至 YYYY-MM")
+    指导老师: str = Field(min_length=2, max_length=20, description="校内指导教师")
+    鉴定意见: str = Field(
+        min_length=200, max_length=800,
+        description="AI 生成，200–800 字",
+    )
+
+
 # ---- Registry / 工具 -----------------------------------------------------
 SCHEMAS = {
     "优秀团员申报表": 优秀团员申报表,
     "奖学金申请表": 奖学金申请表,
     "个人简历": 个人简历,
+    "入党申请书": 入党申请书,
+    "学位论文申请表": 学位论文申请表,
+    "实习鉴定表": 实习鉴定表,
 }
 
 
 def find_schema_for_label(label: str):
     """Best-effort: pick a schema containing a field whose name matches `label`.
 
-    Currently a strict substring check; future Pattern I work could make this
-    smarter (synonym table). Returns the schema class or None.
+    Strategy (R3-A1, Pattern A3 schema-first routing):
+      1. EXACT match — `label == field_name` (preferred; bypasses regex ambiguity)
+      2. SUBSTRING match — `field_name in label` or `label in field_name`
+      3. SYNONYM match — handle common aliases (e.g. "申请人" → "姓名", "E-mail" → "邮箱")
+    Returns the schema class or None.
     """
+    # Synonym table — short list of common DOCX label aliases
+    SYNONYMS = {
+        "申请人": "姓名",
+        "申报人": "姓名",
+        "申请人姓名": "姓名",
+        "E-mail": "邮箱",
+        "email": "邮箱",
+        "电子邮件": "邮箱",
+        "联系方式": "手机",
+        "联系电话": "手机",
+        "指导教师": "指导老师",
+        "校内导师": "指导老师",
+        "论文标题": "论文题目",
+    }
+    canonical = SYNONYMS.get(label, label)
+
+    # Pass 1: exact match (highest priority — fixes first-match-wins)
+    for schema_cls in SCHEMAS.values():
+        if canonical in schema_cls.model_fields:
+            return schema_cls
+    # Pass 2: substring match (fallback)
     for schema_cls in SCHEMAS.values():
         for fname in schema_cls.model_fields:
             if fname in label or label in fname:
                 return schema_cls
+    return None
+
+
+def find_field_in_schema(label: str, schema_cls=None):
+    """Return the canonical field name in `schema_cls` (or any schema) that matches `label`.
+
+    R3-A1 used by `fill_docx.match_field()` to bypass the regex first-match-wins.
+    Returns the canonical field name (str) or None.
+    """
+    SYNONYMS = {
+        "申请人": "姓名",
+        "申报人": "姓名",
+        "申请人姓名": "姓名",
+        "E-mail": "邮箱",
+        "email": "邮箱",
+        "电子邮件": "邮箱",
+        "联系方式": "手机",
+        "联系电话": "手机",
+        "指导教师": "指导老师",
+        "校内导师": "指导老师",
+        "论文标题": "论文题目",
+    }
+    canonical = SYNONYMS.get(label, label)
+    candidates = [schema_cls] if schema_cls else list(SCHEMAS.values())
+    for sc in candidates:
+        if canonical in sc.model_fields:
+            return canonical
+    # Substring match
+    for sc in candidates:
+        for fname in sc.model_fields:
+            if fname in label or label in fname:
+                return fname
     return None
 
 
@@ -165,6 +275,42 @@ def _self_test() -> int:
             "最高学历": "硕士", "毕业院校": "清华大学", "所学专业": "软件工程",
             "自我评价": "本人热爱技术，对软件工程领域充满热情与好奇心，善于团队协作并持续学习。" * 3,
         }, True),
+        # v6.1: R3-A4 new schemas
+        ("入党申请书", {
+            "姓名": "李华", "性别": "男", "出生年月": "2004-05", "籍贯": "江苏省南京市",
+            "民族": "汉族", "政治面貌": "共青团员", "申请日期": "2025-06-01",
+            "入党动机": "我志愿加入中国共产党，为共产主义事业奋斗终身，这是我从大学入学以来一直坚守的信念和追求。" * 5,
+        }, True),
+        ("入党申请书", {
+            "姓名": "李华", "性别": "男", "出生年月": "2004年5月",  # bad: pattern mismatch
+            "籍贯": "江苏", "民族": "汉族", "政治面貌": "共青团员",
+            "申请日期": "2025-06-01", "入党动机": "我志愿加入中国共产党..." * 5,
+        }, False),
+        ("学位论文申请表", {
+            "姓名": "王博士", "学号": "2023001234", "院系": "信息学院",
+            "专业": "计算机科学与技术", "学位": "博士",
+            "导师": "张教授", "论文题目": "基于深度学习的智能填表关键技术研究",
+            "答辩日期": "2026-05-20",
+            "创新点摘要": "本文提出..." * 50,
+        }, True),
+        ("学位论文申请表", {
+            "姓名": "王博士", "学号": "2023001234", "院系": "信息学院",
+            "专业": "CS", "学位": "本科",  # bad: not Literal 硕士/博士
+            "导师": "张教授", "论文题目": "测试题目",
+            "答辩日期": "2026-05-20", "创新点摘要": "本文提出..." * 50,
+        }, False),
+        ("实习鉴定表", {
+            "姓名": "陈同学", "学号": "2021005678", "院系": "经济管理学院",
+            "专业": "金融学", "实习单位": "中国工商银行北京分行",
+            "实习岗位": "客户经理助理", "实习起止": "2024-07 至 2024-09",
+            "指导老师": "刘老师", "鉴定意见": "该同学实习期间表现优异，工作认真负责，积极主动学习业务知识，团队协作能力强，圆满完成了实习任务，获得实习单位一致好评。" * 4,
+        }, True),
+        ("实习鉴定表", {
+            "姓名": "陈同学", "学号": "2021005678", "院系": "经济管理学院",
+            "专业": "金融学", "实习单位": "中国工商银行北京分行",
+            "实习岗位": "客户经理助理", "实习起止": "2024年7月至9月",  # bad: pattern mismatch
+            "指导老师": "刘老师", "鉴定意见": "该同学实习期间表现优异..." * 5,
+        }, False),
     ]
     fail = 0
     for schema_name, sample, should_pass in cases:

@@ -1,13 +1,13 @@
 ---
 name: form-filler
-version: "6.0"
-description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check, reflexion, profile.md spec, audit table render, score harness, Pydantic schema-as-prompt, provider-agnostic LLM adapter. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
+version: "6.1"
+description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check, reflexion, profile.md spec, audit table render, score harness, Pydantic schema-as-prompt, provider-agnostic LLM adapter, schema-first routing, XML-tree merged-cell iteration. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
 metadata:
   openclaw:
     always: false
   i18n:
-    zh: "通用智能填表助手。支持 DOCX/Excel/PDF 等格式表格自动填写，含 OCR、AI 内容生成、信息源深度挖掘、一致性校验、缺失字段迭代收集、Pydantic schema-as-prompt、provider-agnostic LLM adapter"
-    en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/image forms from user profile, with OCR, AI content generation, deep source mining, consistency validation, progressive info collection, Pydantic schema-as-prompt, and provider-agnostic LLM adapter."
+    zh: "通用智能填表助手。支持 DOCX/Excel/PDF 等格式表格自动填写，含 OCR、AI 内容生成、信息源深度挖掘、一致性校验、缺失字段迭代收集、Pydantic schema-as-prompt、provider-agnostic LLM adapter、schema-first routing、XML 树级合并单元格遍历"
+    en: "General-purpose smart form filler. Auto-fill DOCX/Excel/PDF/image forms from user profile, with OCR, AI content generation, deep source mining, consistency validation, progressive info collection, Pydantic schema-as-prompt, provider-agnostic LLM adapter, schema-first routing, and XML-tree merged-cell iteration."
 ---
 
 # 智能填表助手（Form Filler）
