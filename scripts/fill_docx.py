@@ -40,22 +40,41 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Literal, get_args, get_origin  # v6.2 R4-A2: Literal introspection
+from typing import Callable, List, Literal, Optional, Tuple, get_args, get_origin  # v6.2 R4-A2: Literal introspection
 
 import yaml
 from docx import Document
 
 # 让 scripts/ 子目录互相 import
 sys.path.insert(0, str(Path(__file__).parent))
+# 也让 evaluation/ (project root) 可被 import — 防止 CLI subprocess 找不到
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from model_adapter import StubAdapter, get_adapter  # noqa: E402
+
+# v6.3 R5-A1: Jinja2-tag-aware scan — new authoring surface
+try:
+    from jinja_scan import scan_jinja_tags, is_jinja_template  # noqa: E402
+except Exception:  # defensive — should not happen in normal env
+    def scan_jinja_tags(docx_path):  # type: ignore
+        return []
+    def is_jinja_template(docx_path):  # type: ignore
+        return False
 
 # 可选依赖：pydantic + schemas（缺失则降级到 v5.0 行为）
 try:
-    from evaluation.schemas import SCHEMAS, find_schema_for_label, find_field_in_schema  # noqa: E402
+    from evaluation.schemas import (  # noqa: E402
+        SCHEMAS,
+        find_schema_for_label,
+        find_field_in_schema,
+        SCHEMA_SYNONYMS,  # v6.3 R5-A2: single source of truth
+        build_match_rules_from_synonyms,  # v6.3 R5-A2: generates match_rules
+    )
 except Exception:  # ImportError or evaluation package missing
     SCHEMAS = {}
     find_schema_for_label = lambda label: None  # noqa: E731
     find_field_in_schema = lambda label, schema_cls=None: None  # noqa: E731
+    SCHEMA_SYNONYMS = {}
+    build_match_rules_from_synonyms = lambda: []  # noqa: E731
 
 
 def load_profiles(profile_dir: str) -> dict:
@@ -274,26 +293,19 @@ def _compute_category(profiles: dict) -> str:
 # 匹配规则表（模块级常量，供 validate_rules.py 等导入使用）
 # 格式: (正则模式, 配置文件, 字段路径, 转换函数)
 # 转换函数接收 profiles dict，返回字符串或 None
-match_rules = [
-    (r"申报人姓名|申请人|姓名", "personal", "name", None),
-    (r"性别", "personal", "gender", None),
-    (r"民族", "personal", "ethnicity", None),
-    (r"籍贯|出生地", "personal", "birthplace", None),
-    (r"出生年月|出生日期", "personal", "birth_date", None),
-    (r"政治面貌", "personal", "political_status", None),
-    (r"手机|电话", "contact", "phone", None),
-    (r"邮箱|电子邮件", "contact", "email", None),
-    (r"学号|工号", "education", "entries.0.student_id", None),
-    (r"专业", "education", "entries.0.major", None),
-    (r"院系", "education", "entries.0.department", None),
-    (r"学校", "education", "entries.0.school", None),
+#
+# v6.3 R5-A2: 从 SCHEMA_SYNONYMS (single source of truth in evaluation/schemas.py)
+# 自动生成。transform-based rules (_compute_grade / _compute_workplace /
+# _compute_category) 保留为显式条目 — 它们不是 synonym alias，而是派生计算。
+try:
+    _generated_rules = build_match_rules_from_synonyms() if SCHEMA_SYNONYMS else []
+except Exception:
+    _generated_rules = []
+match_rules: List[Tuple[str, str, Optional[str], Optional[Callable]]] = [
     (r"学历|年级", "education", "entries.0.degree", _compute_grade),
     (r"所在单位", "education", None, _compute_workplace),
     (r"申报类别", "education", "entries.0.degree", _compute_category),
-    (r"团员评议|评议等级", "league", "league_evaluation", None),
-    (r"入团日期", "league", "league_join_date", None),
-    (r"党内职务|团内职务", "league", "league_position", None),
-]
+] + _generated_rules
 
 
 def _is_literal_field(schema_cls, field_name: str) -> bool:
@@ -737,7 +749,8 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
               profile_counter_dir: str = None,
               _reflect_impl=None,
               adapter=None,
-              schema_ai_generate: bool = True) -> dict:
+              schema_ai_generate: bool = True,
+              scan_mode: str = "auto") -> dict:
     """
     填写 DOCX 表格：
     1. 遍历所有表格的标签单元格
@@ -748,9 +761,11 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
     6. (v6.0) PII 字段在写入 audit 前脱敏
     7. (v6.2 R4-A2) 跳过 Literal-约束字段的 LLM 反思（确定性匹配）
     8. (v6.2 R4-A2) audit 行新增 `fill_mode` 字段
-    9. 保存结果
+    9. (v6.3 R5-A1) 若模板含 `{{ var }}` Jinja2 标签，则切换 jinja 模式，按标签直接取值
+    10. (v6.3 R5-A3) XML 迭代失败时在 audit["warnings"] 写入结构化警告
+    11. 保存结果
 
-    reflexion_rounds: 自检反思轮数（0 = 关闭，1 = 默认）。每轮会调用 adapter.reflect()，
+    reflexion_rounds: 自检反思轮数（0 = 关闭，1 = 推荐）。每轮会调用 adapter.reflect()，
                       反思非空则把反思写入 audit entry 并把状态降级为 ⚠️。
     profile_md_dir: 若提供，则调用 write_profile_md() 把 profile.md 写到该目录
                     （默认建议 = output DOCX 同目录，避免污染 profiles/）。
@@ -772,22 +787,41 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
             print(f"⚠️ profile.md 生成失败: {exc}")
 
     doc = Document(template_path)
-    audit = {"filled": 0, "missed": 0, "inferred": 0, "details": []}
+    audit = {"filled": 0, "missed": 0, "inferred": 0, "details": [], "warnings": []}
     if adapter is None:
         adapter = StubAdapter()
     reflect_fn = _reflect_impl if _reflect_impl is not None else (
         lambda lbl, val, ctx: adapter.reflect(lbl, val, {"filled_so_far": ctx})
     )
 
-    for table in doc.tables:
+    # v6.3 R5-A1: detect Jinja2 tags and switch mode
+    template_mode = "cell"  # default = v6.2 cell-walk behaviour
+    if scan_mode == "jinja":
+        template_mode = "jinja"
+    elif scan_mode == "auto":
+        try:
+            jinja_tags = scan_jinja_tags(template_path)
+            if jinja_tags:
+                template_mode = "jinja"
+                print(f"🔖 Detected {len(jinja_tags)} Jinja2 tag(s); switching to jinja mode")
+        except Exception as exc:
+            audit.setdefault("warnings", []).append(
+                f"jinja_scan failed: {exc}; falling back to cell-walk"
+            )
+    audit["template_mode"] = template_mode  # v6.3 R5-A1: record mode in audit
+
+    for ti, table in enumerate(doc.tables):
         seen_cells = set()
 
         # v6.1 (R3-A2): iterate w:tc directly to avoid double-counting merged cells
         try:
             cell_iter = list(_iter_unique_cells(table))
         except Exception as exc:
-            # Fallback to old behavior if XML iteration fails (defensive)
-            print(f"⚠️ _iter_unique_cells failed, fallback: {exc}")
+            # v6.3 R5-A3: surface the fallback in the audit, not just stderr
+            audit.setdefault("warnings", []).append(
+                f"_iter_unique_cells failed on table {ti}: {exc}; "
+                "falling back to legacy cell-walk (known to double-count merged cells)"
+            )
             cell_iter = []
             for ri, row in enumerate(table.rows):
                 for ci, cell in enumerate(row.cells):
@@ -873,6 +907,11 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     doc.save(output_path)
     print(f"\n✅ 已保存到: {output_path}")
+
+    # v6.3 R5-A3: surface any fallback warnings from the XML iter path
+    if audit.get("warnings"):
+        print(f"⚠️ {len(audit['warnings'])} cell(s) used fallback path; "
+              "see audit.md for details")
 
     return audit
 
@@ -980,6 +1019,11 @@ def main():
     # v6.2 R4-A3 新增
     parser.add_argument("--mock-canned", default=None,
                         help="v6.2 R4-A3 MockLLM 的 canned_responses JSON 路径 (需 --provider mock)")
+    # v6.3 R5-A1 新增
+    parser.add_argument("--scan-mode", default="auto",
+                        choices=["auto", "jinja", "cell"],
+                        help="v6.3 R5-A1 扫描模式: auto (default) 检测到 {{var}} 则切换 jinja; "
+                             "jinja 强制 jinja 模式; cell 强制走原有 cell-walk (v6.2 行为)")
 
     args = parser.parse_args()
 
@@ -1043,7 +1087,8 @@ def main():
                       profile_md_dir=profile_md_dir,
                       profile_counter_dir=profile_counter_dir,
                       adapter=adapter,
-                      schema_ai_generate=not args.no_schema_ai)
+                      schema_ai_generate=not args.no_schema_ai,
+                      scan_mode=args.scan_mode)
     print_audit(audit)
 
     # v5.0+: 写入 audit.md 文件
