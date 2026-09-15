@@ -47,10 +47,11 @@ from model_adapter import StubAdapter, get_adapter  # noqa: E402
 
 # 可选依赖：pydantic + schemas（缺失则降级到 v5.0 行为）
 try:
-    from evaluation.schemas import SCHEMAS, find_schema_for_label  # noqa: E402
+    from evaluation.schemas import SCHEMAS, find_schema_for_label, find_field_in_schema  # noqa: E402
 except Exception:  # ImportError or evaluation package missing
     SCHEMAS = {}
     find_schema_for_label = lambda label: None  # noqa: E731
+    find_field_in_schema = lambda label, schema_cls=None: None  # noqa: E731
 
 
 def load_profiles(profile_dir: str) -> dict:
@@ -292,7 +293,31 @@ match_rules = [
 
 
 def match_field(label: str, profiles: dict) -> dict:
-    """语义匹配：将表格标签映射到配置文件字段"""
+    """语义匹配：将表格标签映射到配置文件字段。
+
+    v6.1 (R3-A1, Pattern A3 schema-first routing):
+      1. 如果 label 在 evaluation.schemas 的某 schema 字段名中能精确匹配，
+         跳过正则列表，直接从 profile 中按字段名查找（绕开 first-match-wins）。
+      2. 否则，回退到 v5.0 的 match_rules 正则列表。
+    """
+    # Pass 1 (R3-A1): schema-first routing — 精确匹配优先
+    if SCHEMAS:
+        schema_cls = find_schema_for_label(label)
+        if schema_cls is not None:
+            field_name = find_field_in_schema(label, schema_cls)
+            if field_name:
+                # 在 profile 中查找同名字段（personal.name / contact.phone / ...）
+                value = _lookup_profile_field(field_name, profiles)
+                return {
+                    "matched": True,
+                    "config_file": "(schema)",
+                    "field_path": field_name,
+                    "value": value,
+                    "status": "✅" if value else "❌",
+                    "schema": schema_cls.__name__,
+                }
+
+    # Pass 2 (v5.0 compat): regex match_rules
     for pattern, config_file, field_path, transform in match_rules:
         if re.search(pattern, label):
             value = _get_nested_value(profiles.get(config_file, {}), field_path) if field_path else None
@@ -307,6 +332,45 @@ def match_field(label: str, profiles: dict) -> dict:
             }
 
     return {"matched": False, "value": None, "status": "❓"}
+
+
+def _lookup_profile_field(field_name: str, profiles: dict):
+    """R3-A1 helper: 在 profiles dict 中按字段名查找值。
+
+    Profile keys 通常是英文 (name / gender / phone / student_id)，
+    schema field 是中文 (姓名 / 性别 / 手机 / 学号)。本函数做两步：
+
+    1. 尝试直接匹配（如果 profile 也用中文键）
+    2. 否则通过 `match_rules` 反查：找到 label 中能匹配 schema 字段名的
+       规则，使用规则的 (config_file, field_path) 路径取值。
+
+    这样 R3-A1 的 schema-first routing 不会因为中英 key 差异而拿不到值。
+    """
+    # 顶层直接匹配
+    for cfg_name, cfg in profiles.items():
+        if isinstance(cfg, dict) and field_name in cfg and cfg[field_name]:
+            return cfg[field_name]
+    # 嵌套 entries.0.field 直接匹配
+    for cfg_name, cfg in profiles.items():
+        if isinstance(cfg, dict) and "entries" in cfg:
+            for entry in cfg["entries"]:
+                if isinstance(entry, dict) and field_name in entry and entry[field_name]:
+                    return entry[field_name]
+
+    # 通过 match_rules 反查（label 形式 = schema 字段名）
+    for pattern, config_file, field_path, transform in match_rules:
+        if re.search(pattern, field_name) and field_path:
+            value = _get_nested_value(profiles.get(config_file, {}), field_path)
+            if value:
+                return value
+    # transform 形式（_compute_grade / _compute_workplace / _compute_category）
+    for pattern, config_file, field_path, transform in match_rules:
+        if re.search(pattern, field_name) and transform and not field_path:
+            value = transform(profiles)
+            if value:
+                return value
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -599,74 +663,81 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
 
     for table in doc.tables:
         seen_cells = set()
-        rows = list(table.rows)
 
-        for ri, row in enumerate(rows):
-            cells = list(row.cells)
-            for ci, cell in enumerate(cells):
-                cell_id = id(cell._tc)
-                if cell_id in seen_cells:
-                    continue
-                seen_cells.add(cell_id)
+        # v6.1 (R3-A2): iterate w:tc directly to avoid double-counting merged cells
+        try:
+            cell_iter = list(_iter_unique_cells(table))
+        except Exception as exc:
+            # Fallback to old behavior if XML iteration fails (defensive)
+            print(f"⚠️ _iter_unique_cells failed, fallback: {exc}")
+            cell_iter = []
+            for ri, row in enumerate(table.rows):
+                for ci, cell in enumerate(row.cells):
+                    cell_iter.append((ri, ci, cell, id(cell._tc)))
 
-                text = cell.text.strip()
-                if not _is_likely_label(text):
-                    continue
+        for ri, ci, cell, cell_id in cell_iter:
+            if cell_id in seen_cells:
+                continue
+            seen_cells.add(cell_id)
 
-                # 找到标签，尝试匹配
-                result = match_field(text, profiles)
-                if not result["matched"]:
-                    continue
+            text = cell.text.strip()
+            if not _is_likely_label(text):
+                continue
 
-                # 找相邻单元格填入值
-                value_cell = _find_value_cell(table, ri, ci, seen_cells)
-                filled_value = None
-                if value_cell and result["value"]:
-                    # 清空原有内容
-                    for p in value_cell.paragraphs:
-                        for run in p.runs:
-                            run.text = ""
-                    if value_cell.paragraphs:
-                        value_cell.paragraphs[0].text = str(result["value"])
-                    filled_value = result["value"]
-                    status_icon = "✅"
-                else:
-                    status_icon = "❌"
+            # 找到标签，尝试匹配
+            result = match_field(text, profiles)
+            if not result["matched"]:
+                continue
 
-                # Step 5.5 自检反思（走 adapter；StubAdapter 返回 "" = 无意见）
-                reflection_text = ""
-                if reflexion_rounds > 0 and filled_value:
-                    filled_so_far = {
-                        d["label"]: d["value"] for d in audit["details"] if d.get("value")
-                    }
-                    for _ in range(reflexion_rounds):
-                        r = reflect_fn(text, filled_value, filled_so_far)
-                        if not r:
-                            break  # stub: nothing to reflect on
-                        reflection_text = r
-                        status_icon = "⚠️"
-                        filled_so_far[text] = filled_value
+            # 找相邻单元格填入值
+            value_cell = _find_value_cell(table, ri, ci, seen_cells)
+            filled_value = None
+            if value_cell and result["value"]:
+                # 清空原有内容
+                for p in value_cell.paragraphs:
+                    for run in p.runs:
+                        run.text = ""
+                if value_cell.paragraphs:
+                    value_cell.paragraphs[0].text = str(result["value"])
+                filled_value = result["value"]
+                status_icon = "✅"
+            else:
+                status_icon = "❌"
 
-                if filled_value:
-                    audit["filled"] += 1
-                    # v6.0: PII 脱敏后再写入 audit（手机/邮箱/身份证/银行卡）
-                    audit_value = _redact(filled_value) if _redact_label(text) else filled_value
-                    audit["details"].append({
-                        "label": text,
-                        "value": audit_value,
-                        "source": f"{result['config_file']}.yaml",
-                        "status": status_icon,
-                        "reflection": reflection_text,
-                    })
-                else:
-                    audit["missed"] += 1
-                    audit["details"].append({
-                        "label": text,
-                        "value": "",
-                        "source": f"{result['config_file']}.yaml (缺失)",
-                        "status": "❌",
-                        "reflection": "",
-                    })
+            # Step 5.5 自检反思（走 adapter；StubAdapter 返回 "" = 无意见）
+            reflection_text = ""
+            if reflexion_rounds > 0 and filled_value:
+                filled_so_far = {
+                    d["label"]: d["value"] for d in audit["details"] if d.get("value")
+                }
+                for _ in range(reflexion_rounds):
+                    r = reflect_fn(text, filled_value, filled_so_far)
+                    if not r:
+                        break  # stub: nothing to reflect on
+                    reflection_text = r
+                    status_icon = "⚠️"
+                    filled_so_far[text] = filled_value
+
+            if filled_value:
+                audit["filled"] += 1
+                # v6.0: PII 脱敏后再写入 audit（手机/邮箱/身份证/银行卡）
+                audit_value = _redact(filled_value) if _redact_label(text) else filled_value
+                audit["details"].append({
+                    "label": text,
+                    "value": audit_value,
+                    "source": f"{result['config_file']}.yaml",
+                    "status": status_icon,
+                    "reflection": reflection_text,
+                })
+            else:
+                audit["missed"] += 1
+                audit["details"].append({
+                    "label": text,
+                    "value": "",
+                    "source": f"{result['config_file']}.yaml (缺失)",
+                    "status": "❌",
+                    "reflection": "",
+                })
 
     # 保存
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -691,6 +762,37 @@ def _find_value_cell(table, label_row: int, label_col: int, seen_cells: set):
             return cell
 
     return None
+
+
+def _iter_unique_cells(table):
+    """v6.1 (R3-A2, Pattern D2): iterate `w:tc` elements directly to avoid
+    double-counting merged cells.
+
+    python-docx's `table.rows[ri].cells[ci]` returns the SAME `w:tc` element
+    multiple times when a cell is horizontally/vertically merged. By walking
+    the underlying XML tree, each `w:tc` is visited exactly once.
+
+    Yields (row_index, col_index, cell_object, tc_id) tuples with positions
+    reconstructed from the table grid.
+    """
+    tbl = table._tbl
+    rows_seen = 0
+    for tr in tbl.iterchildren("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr"):
+        cells_in_row = []
+        col_idx = 0
+        for tc in tr.iterchildren("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc"):
+            # gridSpan: how many columns this tc occupies
+            gridSpan_el = tc.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tcPr/{http://schemas.openxmlformats.org/wordprocessingml/2006/main}gridSpan")
+            grid_span = int(gridSpan_el.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val", "1")) if gridSpan_el is not None else 1
+            cells_in_row.append((tc, col_idx, grid_span))
+            col_idx += grid_span
+        # Yield each cell once, with its starting column index
+        for tc, start_col, span in cells_in_row:
+            # Build a Cell wrapper from tc (python-docx style)
+            from docx.table import _Cell
+            cell = _Cell(tc, table)
+            yield rows_seen, start_col, cell, id(tc)
+        rows_seen += 1
 
 
 def print_audit(audit: dict):
