@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DOCX 表格填写示例脚本 — form-filler 辅助工具 (v6.0)
+DOCX 表格填写示例脚本 — form-filler 辅助工具 (v6.2)
 
 功能：
   1. 读取 DOCX 表格模板，识别字段结构
@@ -13,6 +13,9 @@ DOCX 表格填写示例脚本 — form-filler 辅助工具 (v6.0)
   8. (v6.0) AI 生成字段走 Pydantic schema-as-prompt（可选；instructor 未装则降级）
   9. (v6.0) 审计表 PII 字段脱敏（手机/邮箱/身份证）
  10. (v6.0) `--introspect-out` 持久化 form-field 扫描结果为 JSON
+ 11. (v6.2 R4-A1) reflect() 失败时自动重试，默认 max_retries=2，CLI 标志 --max-retries N
+ 12. (v6.2 R4-A2) Literal-约束字段走 Pass 0 确定性路由，跳过 LLM 反射
+ 13. (v6.2 R4-A2) audit 行新增 `fill_mode` 字段（literal | schema | regex | llm）
 
 用法：
   python fill_docx.py --template 优秀团员申报表.docx --profile-dir ./profiles --output 优秀团员申报表_已填写.docx
@@ -37,6 +40,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Literal, get_args, get_origin  # v6.2 R4-A2: Literal introspection
 
 import yaml
 from docx import Document
@@ -292,13 +296,74 @@ match_rules = [
 ]
 
 
+def _is_literal_field(schema_cls, field_name: str) -> bool:
+    """v6.2 R4-A2: detect whether a schema field has a `Literal[...]` annotation.
+
+    Returns True iff the Pydantic field's annotation is `Literal["a","b",...]` or
+    `Optional[Literal["a","b",...]]`. When True, the value space is closed and
+    the lookup is fully deterministic — no LLM reflexion call should be made.
+
+    Returns False on any introspection failure (defensive: fall through to the
+    existing reflexion path on edge cases).
+    """
+    if schema_cls is None or not field_name:
+        return False
+    try:
+        field = schema_cls.model_fields.get(field_name)
+        if field is None:
+            return False
+        ann = field.annotation
+        if ann is None:
+            return False
+        # Direct Literal[...] case
+        if get_origin(ann) is Literal:
+            return True
+        # Optional[Literal[...]] → Union[None, Literal[...]]
+        origin = get_origin(ann)
+        if origin is not None and hasattr(origin, "__args__"):
+            for arg in ann.__args__:
+                if get_origin(arg) is Literal:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _literal_values(schema_cls, field_name: str):
+    """v6.2 R4-A2: extract the allowed values from a Literal-typed schema field.
+
+    Returns a list of strings (the literals) or an empty list if the field is
+    not Literal-typed or the introspection fails.
+    """
+    if not _is_literal_field(schema_cls, field_name):
+        return []
+    try:
+        field = schema_cls.model_fields[field_name]
+        ann = field.annotation
+        if get_origin(ann) is Literal:
+            return list(get_args(ann))
+        # Optional[Literal[...]] case
+        for arg in ann.__args__:
+            if get_origin(arg) is Literal:
+                return list(get_args(arg))
+        return []
+    except Exception:
+        return []
+
+
 def match_field(label: str, profiles: dict) -> dict:
     """语义匹配：将表格标签映射到配置文件字段。
 
     v6.1 (R3-A1, Pattern A3 schema-first routing):
-      1. 如果 label 在 evaluation.schemas 的某 schema 字段名中能精确匹配，
-         跳过正则列表，直接从 profile 中按字段名查找（绕开 first-match-wins）。
-      2. 否则，回退到 v5.0 的 match_rules 正则列表。
+      Pass 1: 如果 label 在 evaluation.schemas 的某 schema 字段名中能精确匹配，
+              跳过正则列表，直接从 profile 中按字段名查找（绕开 first-match-wins）。
+      Pass 2: 否则，回退到 v5.0 的 match_rules 正则列表。
+
+    v6.2 (R4-A2, Pattern O1 — Literal-first deterministic routing):
+      在 Pass 1 内部，当 schema 字段是 `Literal[...]` 时，对 profile 值做
+      case/whitespace-tolerant 匹配。如果 profile 值在 Literal 集合内，
+      直接返回 `{fill_mode: "literal"}`；否则记录一次警告（profile 数据 bug），
+      仍走 schema-first 路径（不要让 LLM 选一个 LLM 不知道的闭集）。
     """
     # Pass 1 (R3-A1): schema-first routing — 精确匹配优先
     if SCHEMAS:
@@ -306,15 +371,65 @@ def match_field(label: str, profiles: dict) -> dict:
         if schema_cls is not None:
             field_name = find_field_in_schema(label, schema_cls)
             if field_name:
-                # 在 profile 中查找同名字段（personal.name / contact.phone / ...）
+                # v6.2 R4-A2 — Literal-first check (Pass 0 within Pass 1)
+                literals = _literal_values(schema_cls, field_name)
                 value = _lookup_profile_field(field_name, profiles)
+                if literals:
+                    # Literal-typed field: deterministic routing check
+                    norm_value = str(value).strip() if value is not None else ""
+                    norm_literals = {str(x).strip() for x in literals}
+                    if norm_value and norm_value in norm_literals:
+                        return {
+                            "matched": True,
+                            "config_file": "(schema-literal)",
+                            "field_path": field_name,
+                            "value": value,
+                            "status": "✅",
+                            "schema": schema_cls.__name__,
+                            "fill_mode": "literal",
+                            "literals": sorted(norm_literals),
+                        }
+                    if norm_value:
+                        # Value not in the literal set — profile bug
+                        print(
+                            f"⚠️ profile value for '{field_name}' ({norm_value!r}) "
+                            f"not in Literal set {sorted(norm_literals)}; "
+                            f"LLM reflexion skipped (closed enum cannot infer).",
+                            file=sys.stderr,
+                        )
+                    # Value missing or mismatch — fall through to schema-first
+                    # but mark fill_mode so audit shows the routing decision.
+                    if value is not None:
+                        return {
+                            "matched": True,
+                            "config_file": "(schema-literal-mismatch)",
+                            "field_path": field_name,
+                            "value": value,
+                            "status": "⚠️",
+                            "schema": schema_cls.__name__,
+                            "fill_mode": "literal-mismatch",
+                            "literals": sorted(norm_literals),
+                        }
+                # Standard schema-first path (Literal check skipped or no value)
+                if value:
+                    return {
+                        "matched": True,
+                        "config_file": "(schema)",
+                        "field_path": field_name,
+                        "value": value,
+                        "status": "✅",
+                        "schema": schema_cls.__name__,
+                        "fill_mode": "schema",
+                    }
+                # value is None — try schema-first with no value (will be ❌)
                 return {
                     "matched": True,
                     "config_file": "(schema)",
                     "field_path": field_name,
-                    "value": value,
-                    "status": "✅" if value else "❌",
+                    "value": None,
+                    "status": "❌",
                     "schema": schema_cls.__name__,
+                    "fill_mode": "schema",
                 }
 
     # Pass 2 (v5.0 compat): regex match_rules
@@ -329,9 +444,10 @@ def match_field(label: str, profiles: dict) -> dict:
                 "field_path": field_path,
                 "value": value,
                 "status": "✅" if value else "❌",
+                "fill_mode": "regex",
             }
 
-    return {"matched": False, "value": None, "status": "❓"}
+    return {"matched": False, "value": None, "status": "❓", "fill_mode": "unmatched"}
 
 
 def _lookup_profile_field(field_name: str, profiles: dict):
@@ -630,7 +746,9 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
     4. 处理合并单元格
     5. 可选：对每个填入字段调用 adapter.reflect() 做自检反思
     6. (v6.0) PII 字段在写入 audit 前脱敏
-    7. 保存结果
+    7. (v6.2 R4-A2) 跳过 Literal-约束字段的 LLM 反思（确定性匹配）
+    8. (v6.2 R4-A2) audit 行新增 `fill_mode` 字段
+    9. 保存结果
 
     reflexion_rounds: 自检反思轮数（0 = 关闭，1 = 默认）。每轮会调用 adapter.reflect()，
                       反思非空则把反思写入 audit entry 并把状态降级为 ⚠️。
@@ -689,6 +807,9 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
             if not result["matched"]:
                 continue
 
+            # v6.2 R4-A2: track fill_mode for audit transparency
+            fill_mode = result.get("fill_mode", "unknown")
+
             # 找相邻单元格填入值
             value_cell = _find_value_cell(table, ri, ci, seen_cells)
             filled_value = None
@@ -704,9 +825,13 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
             else:
                 status_icon = "❌"
 
+            # v6.2 R4-A2: Literal-约束字段跳过 LLM 反思（已校验过枚举值）
+            # Reflection would be redundant for closed-enum fields.
+            skip_llm = (fill_mode == "literal")
+
             # Step 5.5 自检反思（走 adapter；StubAdapter 返回 "" = 无意见）
             reflection_text = ""
-            if reflexion_rounds > 0 and filled_value:
+            if reflexion_rounds > 0 and filled_value and not skip_llm:
                 filled_so_far = {
                     d["label"]: d["value"] for d in audit["details"] if d.get("value")
                 }
@@ -717,6 +842,9 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                     reflection_text = r
                     status_icon = "⚠️"
                     filled_so_far[text] = filled_value
+            elif skip_llm and reflexion_rounds > 0 and filled_value:
+                # Record the deterministic skip in the audit
+                reflection_text = "[skip-llm: literal]"
 
             if filled_value:
                 audit["filled"] += 1
@@ -728,6 +856,7 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                     "source": f"{result['config_file']}.yaml",
                     "status": status_icon,
                     "reflection": reflection_text,
+                    "fill_mode": fill_mode,  # v6.2 R4-A2: routing trace
                 })
             else:
                 audit["missed"] += 1
@@ -737,6 +866,7 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                     "source": f"{result['config_file']}.yaml (缺失)",
                     "status": "❌",
                     "reflection": "",
+                    "fill_mode": fill_mode,  # v6.2 R4-A2: routing trace
                 })
 
     # 保存
@@ -832,8 +962,8 @@ def main():
                         help="v5.0+ 写入对照表的「表格名称」字段")
     # v6.0 新增
     parser.add_argument("--provider", default="stub",
-                        choices=["stub", "openai-compatible"],
-                        help="v6.0 Model Adapter provider (默认 stub = v5.0 行为；openai-compatible 启用真实 LLM)")
+                        choices=["stub", "openai-compatible", "mock"],
+                        help="v6.0 Model Adapter provider (默认 stub = v5.0 行为；openai-compatible 启用真实 LLM；mock 启用离线测试桩 v6.2 R4-A3)")
     parser.add_argument("--llm-base-url", default=None,
                         help="v6.0 OpenAI 兼容 endpoint base URL (也可 LLM_BASE_URL 环境变量)")
     parser.add_argument("--llm-api-key", default=None,
@@ -844,6 +974,12 @@ def main():
                         help="v6.0 持久化表格扫描结果为 JSON (Pattern J)")
     parser.add_argument("--no-schema-ai", action="store_true",
                         help="v6.0 关闭 Pydantic schema-as-prompt，强制走原始 prompt 路径")
+    # v6.2 R4-A1 新增
+    parser.add_argument("--max-retries", type=int, default=None,
+                        help="v6.2 R4-A1 LLM reflect() 失败重试次数 (默认 2；设 0 关闭 = v6.0 行为；也可 LLM_REFLECT_RETRIES 环境变量)")
+    # v6.2 R4-A3 新增
+    parser.add_argument("--mock-canned", default=None,
+                        help="v6.2 R4-A3 MockLLM 的 canned_responses JSON 路径 (需 --provider mock)")
 
     args = parser.parse_args()
 
@@ -855,13 +991,25 @@ def main():
         sys.exit(1)
 
     # v6.0: 初始化 Model Adapter（默认 stub 保持 v5.0 行为）
-    adapter = get_adapter(
+    # v6.2 R4-A1: max_retries 透传到 OpenAICompatibleAdapter；v6.2 R4-A3: mock 接收 canned_responses
+    adapter_kwargs = dict(
         provider=args.provider,
         base_url=args.llm_base_url,
         api_key=args.llm_api_key,
         model_name=args.llm_model_name,
     )
-    print(f"🤖 Model Adapter: {adapter.name} (live={adapter.is_live()})")
+    if args.max_retries is not None:
+        adapter_kwargs["max_retries"] = args.max_retries
+    if args.provider == "mock" and args.mock_canned:
+        try:
+            with open(args.mock_canned, "r", encoding="utf-8") as f:
+                adapter_kwargs["canned_responses"] = json.load(f)
+        except Exception as exc:
+            print(f"⚠️ 加载 mock-canned JSON 失败: {exc}；使用空 canned dict",
+                  file=sys.stderr)
+            adapter_kwargs["canned_responses"] = {}
+    adapter = get_adapter(**adapter_kwargs)
+    print(f"🤖 Model Adapter: {adapter.name} (live={adapter.is_live()}, max_retries={getattr(adapter, 'max_retries', 0)})")
 
     # 扫描模板
     print(f"\n🔍 扫描模板: {args.template}")
