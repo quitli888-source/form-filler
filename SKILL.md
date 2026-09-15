@@ -253,11 +253,14 @@ form-filler/
 **产物**：
 
 ```
+{output_dir}/                    ← 紧随 --output 指定的目录，避免污染 profiles/
+├── profile.md                   ← 稳定拷贝，永远指向最新版本
+├── profile_v0.md                ← 第一次生成（基线）
+├── profile_v1.md                ← 第二次生成
+└── profile_v{N}.md              ← 第 N 次生成（N 从 0 起，按已有文件数递增）
+
 profiles/
-├── profile.md          ← 稳定符号链接（或拷贝），永远指向最新版本
-├── profile_v0.md       ← 第一次生成（基线）
-├── profile_v1.md       ← 第二次生成
-└── profile_v{N}.md     ← 第 N 次生成（N 从 0 起，按已有文件数递增）
+└── .profile_counter             ← 版本号计数器（被 .gitignore 排除）
 ```
 
 **内容结构**（`profile.md` 必须按此顺序呈现）：
@@ -304,7 +307,7 @@ SHA-256(正文) = {xxxxxxxx}
 1. **每个字段标注来源**：`personal.name` 这种点分路径直接写在值旁边，便于追溯。
 2. **空字段保留为 `<未填>`** 而不是删除——避免后续 prompt 因找不到字段而重新生成。
 3. **`DO NOT CONTRADICT` 段必须位于最顶部**——后续所有 Step 3–8 的 prompt 模板第一行必须是「`@profile.md` 优先，任何与此文件矛盾的字段值视为错误」。
-4. **生成时机**：Step 2A/2B 完成 → 立即调用 `scripts/fill_docx.py --write-profile` 或 `write_profile_md(profiles, out_dir)`。若用户跳过 Step 2A/2B（如模板替换场景），仍需先生成 `profile.md`。
+4. **生成时机**：Step 2A/2B 完成 → 立即调用 `scripts/fill_docx.py --write-profile --output <docx_path>` 或 `write_profile_md(profiles, out_dir=<docx_dir>)`。`profile.md` 与 `profile_v{N}.md` 写入 `<docx_dir>`（即 `--output` 所在目录），计数器 `.profile_counter` 留在 `profiles/`（被 `.gitignore` 排除）。若用户跳过 Step 2A/2B（如模板替换场景），仍需先生成 `profile.md`。
 5. **审计表关联**：填写对照表的「数据来源」列从此指向 `profile.md` 而非 `personal.yaml`，但保留 `personal.yaml` 作为底层 source-of-truth。
 
 **引用约定**（Anti-pattern 2 缓解）：
