@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 from fill_docx import (
     _redact, _stub_reflect, match_field, scan_docx_introspect,
     write_profile_md, fill_docx, _is_literal_field, _literal_values,
+    _iter_unique_cells,  # v6.3 R5-A3: monkey-patch target for fallback test
 )
 from model_adapter import StubAdapter, OpenAICompatibleAdapter, get_adapter
 
@@ -466,6 +467,79 @@ class TestFillModeAuditColumn(unittest.TestCase):
         # No reflect() should be called for 性别
         self.assertNotIn("性别", reflect_calls,
                          f"reflect() must NOT be called for literal fields; calls: {reflect_calls}")
+
+
+class TestXMLIterFallbackLogged(unittest.TestCase):
+    """v6.3 R5-A3: XML iter fallback must surface in audit["warnings"].
+
+    The old code at L786-794 silently fell back to the double-counting
+    `for ri, row in enumerate(table.rows)` pattern on any exception.
+    R5-A3 replaces the silent fallback with a structured audit warning.
+    """
+
+    FIXTURE = ROOT / "tests" / "fixtures" / "simple.docx"
+    PROFILE = {
+        "personal": {"name": "张三", "gender": "男"},
+        "contact": {"phone": "13812345678", "email": "z@example.com"},
+        "education": {"entries": [{
+            "school": "ZJU", "department": "CS", "major": "CS",
+            "degree": "本科", "student_id": "12345678", "start_date": "2024-09",
+        }]},
+    }
+
+    def setUp(self):
+        if not self.FIXTURE.exists():
+            self.skipTest(f"fixture missing: {self.FIXTURE}")
+        self.out_dir = ROOT / "tests" / "_tmp_out"
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        if self.out_dir.exists():
+            shutil.rmtree(self.out_dir, ignore_errors=True)
+
+    def test_xml_iter_fallback_logged(self):
+        """R5-A3 test 1: mock _iter_unique_cells to raise; verify warning
+        appears in audit["warnings"], not just stderr."""
+        import fill_docx as fd
+        original_iter = fd._iter_unique_cells
+
+        def boom(table):
+            raise RuntimeError("simulated XML iter failure")
+
+        fd._iter_unique_cells = boom
+        try:
+            out = self.out_dir / "filled.docx"
+            audit = fd.fill_docx(
+                str(self.FIXTURE), self.PROFILE, str(out),
+                adapter=StubAdapter(),
+            )
+            # audit["warnings"] must be present and contain the expected string
+            self.assertIn("warnings", audit,
+                          f"audit should contain 'warnings' key: {audit}")
+            self.assertGreater(len(audit["warnings"]), 0,
+                               f"At least one warning should be logged: {audit}")
+            joined = " ".join(audit["warnings"])
+            self.assertIn("_iter_unique_cells failed", joined,
+                          f"Warning should reference the failure: {joined}")
+            self.assertIn("simulated XML iter failure", joined,
+                          f"Warning should include the exception msg: {joined}")
+            # Graceful degrade: fill should still complete (not crash)
+            self.assertIsInstance(audit.get("details"), list)
+        finally:
+            fd._iter_unique_cells = original_iter
+
+    def test_no_warnings_on_clean_input(self):
+        """R5-A3 test 2: clean input (no XML iter exception) → audit["warnings"]
+        must be empty (no false positives)."""
+        out = self.out_dir / "filled.docx"
+        audit = fill_docx(
+            str(self.FIXTURE), self.PROFILE, str(out),
+            adapter=StubAdapter(),
+        )
+        warnings = audit.get("warnings", [])
+        self.assertEqual(warnings, [],
+                         f"Clean input should produce no warnings: {warnings}")
 
 
 if __name__ == "__main__":

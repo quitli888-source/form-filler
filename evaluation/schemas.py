@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 try:
     from pydantic import BaseModel, Field
@@ -166,6 +166,93 @@ SCHEMAS = {
 }
 
 
+# v6.3 R5-A2: single source of truth for label aliases.
+# Consumed by find_schema_for_label, find_field_in_schema, AND
+# scripts/fill_docx.py:match_rules (auto-generated from this dict).
+# Adding a new alias requires editing ONE place instead of two.
+SCHEMA_SYNONYMS: Dict[str, str] = {
+    # 姓名 aliases (优秀团员申报表 / 入党申请书 / 学位论文申请表 / 个人简历 / 实习鉴定表 / 奖学金申请表)
+    "申请人": "姓名",
+    "申报人": "姓名",
+    "申请人姓名": "姓名",
+    # 邮箱 aliases (优秀团员申报表 / 个人简历)
+    "E-mail": "邮箱",
+    "email": "邮箱",
+    "电子邮件": "邮箱",
+    # 手机 aliases (优秀团员申报表 / 奖学金申请表 / 个人简历)
+    "联系方式": "手机",
+    "联系电话": "手机",
+    # 指导老师 aliases (学位论文申请表 / 实习鉴定表)
+    "指导教师": "指导老师",
+    "校内导师": "指导老师",
+    # 论文题目 alias (学位论文申请表)
+    "论文标题": "论文题目",
+    # v6.3 R5-A2 additions: promote regex-only entries from v6.2 match_rules
+    # so the dedup is exhaustive (no synonym cluster lives ONLY in regex form).
+    "工号": "学号",
+    "出生地": "籍贯",
+    "电话": "手机",
+}
+
+# Mapping from canonical schema field name → profile (config_file, field_path).
+# Mirrors the v6.2 hardcoded match_rules so the auto-generation preserves the
+# same lookup destinations.
+_CANONICAL_TO_PROFILE: Dict[str, Tuple[str, str]] = {
+    "姓名": ("personal", "name"),
+    "性别": ("personal", "gender"),
+    "民族": ("personal", "ethnicity"),
+    "籍贯": ("personal", "birthplace"),
+    "出生年月": ("personal", "birth_date"),
+    "政治面貌": ("personal", "political_status"),
+    "手机": ("contact", "phone"),
+    "邮箱": ("contact", "email"),
+    "学号": ("education", "entries.0.student_id"),
+    "专业": ("education", "entries.0.major"),
+    "院系": ("education", "entries.0.department"),
+    "学校": ("education", "entries.0.school"),
+    "团员评议": ("league", "league_evaluation"),
+    "入团日期": ("league", "league_join_date"),
+    "团内职务": ("league", "league_position"),
+}
+
+
+def build_match_rules_from_synonyms() -> List[Tuple[str, str, Optional[str], Optional[object]]]:
+    """v6.3 R5-A2: generate the v6.2 match_rules regex list from SCHEMA_SYNONYMS.
+
+    Returns a list of `(pattern, config_file, field_path, transform)` tuples
+    suitable for direct use in fill_docx.py:match_field() Pass 2 (regex path)
+    AND `_lookup_profile_field()`'s reverse-lookup loop.
+
+    Pattern is `r"alias1|alias2|...|canonical"` (re.escape'd to handle
+    metacharacters safely). transform is always None — synonym clusters
+    are pure mappings, not derived computations.
+
+    Source-of-truth iteration:
+      1. Iterate over `_CANONICAL_TO_PROFILE` (every field that has a
+         profile mapping) — this covers fields WITHOUT aliases (性别,
+         民族, 专业, etc.) that v6.2 had as explicit match_rules entries.
+      2. For each canonical, union in any aliases from SCHEMA_SYNONYMS so
+         the pattern also matches the alias forms.
+
+    Output is sorted by canonical name for reproducibility + test stability.
+    """
+    # Group aliases by their canonical name
+    clusters: Dict[str, List[str]] = {}
+    for alias, canonical in SCHEMA_SYNONYMS.items():
+        clusters.setdefault(canonical, []).append(alias)
+
+    rules: List[Tuple[str, str, Optional[str], Optional[object]]] = []
+    for canonical in sorted(_CANONICAL_TO_PROFILE.keys()):
+        config_file, field_path = _CANONICAL_TO_PROFILE[canonical]
+        # Build the pattern: canonical name + any aliases from SCHEMA_SYNONYMS
+        aliases = clusters.get(canonical, [])
+        all_forms = sorted({canonical, *aliases})
+        pattern = "|".join(re.escape(a) for a in all_forms)
+        rules.append((pattern, config_file, field_path, None))
+
+    return rules
+
+
 def find_schema_for_label(label: str):
     """Best-effort: pick a schema containing a field whose name matches `label`.
 
@@ -175,21 +262,8 @@ def find_schema_for_label(label: str):
       3. SYNONYM match — handle common aliases (e.g. "申请人" → "姓名", "E-mail" → "邮箱")
     Returns the schema class or None.
     """
-    # Synonym table — short list of common DOCX label aliases
-    SYNONYMS = {
-        "申请人": "姓名",
-        "申报人": "姓名",
-        "申请人姓名": "姓名",
-        "E-mail": "邮箱",
-        "email": "邮箱",
-        "电子邮件": "邮箱",
-        "联系方式": "手机",
-        "联系电话": "手机",
-        "指导教师": "指导老师",
-        "校内导师": "指导老师",
-        "论文标题": "论文题目",
-    }
-    canonical = SYNONYMS.get(label, label)
+    # v6.3 R5-A2: SCHEMA_SYNONYMS is the single source of truth (was an inline dict).
+    canonical = SCHEMA_SYNONYMS.get(label, label)
 
     # Pass 1: exact match (highest priority — fixes first-match-wins)
     for schema_cls in SCHEMAS.values():
@@ -209,20 +283,8 @@ def find_field_in_schema(label: str, schema_cls=None):
     R3-A1 used by `fill_docx.match_field()` to bypass the regex first-match-wins.
     Returns the canonical field name (str) or None.
     """
-    SYNONYMS = {
-        "申请人": "姓名",
-        "申报人": "姓名",
-        "申请人姓名": "姓名",
-        "E-mail": "邮箱",
-        "email": "邮箱",
-        "电子邮件": "邮箱",
-        "联系方式": "手机",
-        "联系电话": "手机",
-        "指导教师": "指导老师",
-        "校内导师": "指导老师",
-        "论文标题": "论文题目",
-    }
-    canonical = SYNONYMS.get(label, label)
+    # v6.3 R5-A2: SCHEMA_SYNONYMS is the single source of truth (was an inline dict).
+    canonical = SCHEMA_SYNONYMS.get(label, label)
     candidates = [schema_cls] if schema_cls else list(SCHEMAS.values())
     for sc in candidates:
         if canonical in sc.model_fields:
