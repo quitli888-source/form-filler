@@ -1,6 +1,6 @@
 ---
 name: form-filler
-version: "6.1"
+version: "6.4"
 description: "通用智能填表助手。Auto-fill DOCX/Excel/PDF/image forms with OCR, AI generation, deep mining, consistency check, reflexion, profile.md spec, audit table render, score harness, Pydantic schema-as-prompt, provider-agnostic LLM adapter, schema-first routing, XML-tree merged-cell iteration. 触发：填表/申报表/奖学金/简历/报销/自荐信/申请表"
 metadata:
   openclaw:
@@ -410,6 +410,7 @@ for each 缺失字段:
 ### Step 5.5: 自检反思（Reflexion）
 
 > v4.1 新增（Pattern C / Reflexion 模式），v6.0 升级：走 **Model Adapter**（Pattern F2）—— 默认 `stub` 保持离线，启用 `--provider openai-compatible` 后调用真实 LLM。
+> v6.4 升级（R6-A1）：`--reflexion-rounds N≥2` 时，后续轮次的反思 prompt 携带之前轮次的反思原文（`prior_reflections` 回喂，adapter 侧仅取最后 3 条），多轮反思任务递进而非重复。
 
 目的：在填写对照表（Step 7）的「阻断级」一致性校验之前，先由模型对**每一个已生成字段**做一次轻量自检，把矛盾 / 超限 / 幻觉当场拦下，避免污染下游。
 
@@ -441,12 +442,14 @@ for each 缺失字段:
 | 反思结果 | 行为 |
 |---------|------|
 | `OK` 或空字符串 | 提交到对照表，状态 `✅` / `📝`（取决于是否 AI 生成） |
-| 非空陈述（发现问题） | 状态标记 `⚠️` 并把反思原文写入对照表的「自检反思」列；**且**重新调用 Step 5 用反思作为额外上下文重生成一次（仅 1 次重试） |
+| 非空陈述（发现问题） | 状态标记 `⚠️` 并把反思原文写入对照表的「自检反思」列；`--reflexion-rounds N≥2` 时该反思原文进入下一轮的反思 prompt（`prior_reflections` 回喂，仅最后 3 条），第 k 轮（k≥2）在既有反思基础上重新审计该字段 |
 | 重试后仍有问题 | 保留 `⚠️` + 反思，提交给用户在 Step 7.5 阻断决策中处理 |
+
+> **v6.4 文档-代码对齐说明**：v6.3 及以前的文档承诺「非空陈述时重新调用 Step 5 用反思作为额外上下文重生成一次（仅 1 次重试）」。该**重生成能力在代码中从未实现**（历史 near-no-op：反思原文从不回喂，temperature=0.0 下多轮反思任务实质相同），v6.4 起本文档只描述已实现的行为（prior_reflections 回喂）。「用反思重生成字段值」列为 **future work**，实现前不得在文档中承诺。
 
 **反思写入对照表**：`templates/audit_table.md` 的字段详情表新增 `自检反思` 列，1–2 句陈述句或 `—`。
 
-**CLI 控制**：反思轮数通过 `--reflexion-rounds N` 控制（默认 0 = 关闭，1 = 推荐）。脚本实现：`scripts/fill_docx.py` 暴露 `reflect(field_label, field_value, context) -> str`，无 LLM 时通过 `ModelAdapter` 抽象的 `StubAdapter` 返回 `""`，不阻塞端到端流程。启用真实 LLM 见 [Step 5A Schema-constrained 路径](#step-5a-schema-constrained-路径v60-新增)。
+**CLI 控制**：反思轮数通过 `--reflexion-rounds N` 控制（默认 0 = 关闭，1 = 推荐）。脚本实现：`scripts/fill_docx.py` 暴露 `reflect(field_label, field_value, context, prior_reflections=None) -> str`，无 LLM 时通过 `ModelAdapter` 抽象的 `StubAdapter` 返回 `""`，不阻塞端到端流程。`N≥2` 时第 k 轮（k≥2）的反思 prompt 会附带前 k-1 轮的反思原文（回喂语义见上文「反思结果处理」表）；`N=0/1` 时 prompt 与 v6.3 逐字节相同。启用真实 LLM 见 [Step 5A Schema-constrained 路径](#step-5a-schema-constrained-路径v60-新增)。
 
 **与 Step 7.5 的关系**：Step 5.5 是「填写时」反思（per-field），Step 7.5 是「提交前」整表校验（cross-field）。两者互补，不重复——5.5 拦的是单字段自相矛盾，7.5 拦的是跨字段 / 表级硬规则。
 

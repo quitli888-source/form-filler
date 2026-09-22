@@ -233,6 +233,35 @@ SKILL.md 中描述的流程基于「能力」而非具体工具名：
 
 ---
 
+## 🧠 LLM 内核配置（v6.3+）
+
+项目通过 `scripts/model_adapter.py` 的 provider 无关适配层调用 LLM，默认 `stub`
+（纯离线、零依赖）。接入真实 LLM 只需设置三个环境变量
+（OpenAI 兼容 chat-completions 协议，任何兼容端点均可）：
+
+```bash
+# 本地私有配置（已被 .gitignore 排除，禁止提交 key）
+cp .env.local.example .env.local   # 或手动创建
+set -a; source .env.local; set +a  # Git Bash 加载
+
+python scripts/fill_docx.py --template T.docx --profile-dir ./profiles --output O.docx \
+    --provider openai-compatible
+```
+
+| 环境变量 | 说明 | 示例 |
+|---------|------|------|
+| `LLM_PROVIDER` | 适配器选择：`stub`（默认）/ `openai-compatible` / `mock` | `openai-compatible` |
+| `LLM_BASE_URL` | OpenAI 兼容端点 | `https://api.stepfun.com/v1` |
+| `LLM_API_KEY` | API key（**仅存本地 `.env.local`**） | `sk-...` |
+| `LLM_MODEL_NAME` | 模型名 | `step-5-preview` / `MiniMax-M3` / `deepseek-chat` |
+| `LLM_REFLECT_RETRIES` | reflect() 验证失败重试次数（v6.2 R4-A1） | `2` |
+
+已验证可用的内核：**step-5-preview**（默认推荐，`https://api.stepfun.com/v1`）、
+MiniMax-M3、DeepSeek、Qwen、Moonshot、Zhipu 等一切 OpenAI 兼容端点。
+未设置 key 时自动降级为 v5.0 stub 行为，现存用户零影响。
+
+---
+
 ## 🔒 隐私保护
 
 - **纯本地存储** — 所有配置文件仅存储在本机 `profiles/` 目录

@@ -450,7 +450,7 @@ class TestFillModeAuditColumn(unittest.TestCase):
         # Track reflect calls — should be 0 because literal fields skip LLM
         reflect_calls = []
 
-        def tracking_reflect(label, value, ctx):
+        def tracking_reflect(label, value, ctx, prior_reflections=None):
             reflect_calls.append(label)
             return ""
 

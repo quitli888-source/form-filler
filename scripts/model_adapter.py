@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-scripts/model_adapter.py — form-filler v6.2 provider-agnostic Model Adapter
+scripts/model_adapter.py — form-filler v6.4 provider-agnostic Model Adapter
 
 历史：
   v6.0 (R2-A1, Pattern F2): 抽出 `ModelAdapter` ABC + Stub/OpenAI 两个实现
   v6.1 (R3-A1): 把 OpenAICompatible 用 instructor 包了一层
   v6.2 (R4-A1, Pattern I1): reflect() 增加重试-on-validation-failure 循环
   v6.2 (R4-A3, Pattern G2): 新增 MockLLMAdapter 离线测试桩
+  v6.4 (R6-A2): generate_struct() 校验错误回喂 + json_repair 可选修复层
+  v6.4 (R6-A1): reflect() 增加 prior_reflections 反馈闭环参数
 
 目的：把 LLM 调用从 fill_docx.py 的 plumbing-only stub 抽到一个可插拔的 Adapter 层。
 让同一份 fill_docx.py 代码既能离线跑（CI / 演示 / 敏感文档），也能调用任何
@@ -19,6 +21,8 @@ OpenAI 兼容 endpoint（OpenAI / DeepSeek / minimax m3 / Qwen / Moonshot / Zhip
   3. `OpenAICompatibleAdapter` 用 `instructor` 库（基于 OpenAI SDK）包装任意
      OpenAI 兼容 endpoint。`instructor` 缺失时自动降级到裸 OpenAI SDK。
      (v6.2) reflect() 内置 retry-on-failure 循环，默认 max_retries=2。
+     (v6.4) generate_struct() 的重试会把校验错误格式化为反馈块追加进 prompt；
+            plain 分支在 json_repair 可用时先修复再校验。
   4. (v6.2) `MockLLMAdapter` 接受 `canned_responses` dict 用于离线测试；
      `provider="mock"` 时注册，无需 API key。
   5. 通过环境变量 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL_NAME` 提供默认值，
@@ -26,19 +30,60 @@ OpenAI 兼容 endpoint（OpenAI / DeepSeek / minimax m3 / Qwen / Moonshot / Zhip
 
 依赖：
   - 必需：标准库
-  - 可选：openai>=1.0；instructor>=1.0；pydantic>=2.0
-    （都缺失则 OpenAICompatibleAdapter 在 __init__ 时抛 ImportError，明确告知用户）
+  - 可选：openai>=1.0；instructor>=1.0；pydantic>=2.0；json-repair
+    （都缺失则 OpenAICompatibleAdapter 在 __init__ 时抛 ImportError，明确告知用户；
+     缺 json-repair 时 generate_struct 行为同 v6.3）
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Type, TypeVar
 
 T = TypeVar("T")
+
+
+def _format_validation_feedback(exc: BaseException) -> str:
+    """v6.4 (R6-A2): 把 schema 校验失败格式化为可回喂给 LLM 的反馈块。
+
+    风格借鉴 pydantic-ai 的 `RetryPromptPart.from_validation_error`（只借格式，
+    不引库）：
+      - `pydantic.ValidationError` → 只取 `exc.errors()` 的 loc/msg/type
+        （去掉 ctx/input/url），`json.dumps(..., ensure_ascii=False, indent=2)`
+        序列化后用 ```json 代码围栏包住，标注错误条数；
+      - 其他异常 → 直接 `str(exc)`。
+    两者都以同一句指令式收尾 "Fix the errors and try again."，明确要求模型
+    修正后重试。pydantic 未安装时退化为 `str(exc)` 路径（pydantic 是可选依赖）。
+    """
+    instruction = "Fix the errors and try again."
+    try:
+        import pydantic
+    except ImportError:
+        # pydantic 缺失（可选依赖）——退化为纯文本路径
+        return f"{exc}\n\n{instruction}"
+    if isinstance(exc, pydantic.ValidationError):
+        try:
+            errors = [
+                {
+                    "loc": list(err.get("loc", [])),
+                    "msg": err.get("msg", ""),
+                    "type": err.get("type", ""),
+                }
+                for err in exc.errors()
+            ]
+            body = json.dumps(errors, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001 — errors() 本身失败的极端情况
+            return f"{exc}\n\n{instruction}"
+        return (
+            f"{len(errors)} validation error(s):\n"
+            f"```json\n{body}\n```\n\n"
+            f"{instruction}"
+        )
+    return f"{exc}\n\n{instruction}"
 
 
 class ModelAdapter(ABC):
@@ -63,8 +108,13 @@ class ModelAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def reflect(self, field_label: str, field_value: Any, ctx: dict) -> str:
-        """Self-critique a single filled field. Returns "" when no objection."""
+    def reflect(self, field_label: str, field_value: Any, ctx: dict,
+                prior_reflections: Optional[list] = None) -> str:
+        """Self-critique a single filled field. Returns "" when no objection.
+
+        v6.4 (R6-A1): `prior_reflections` 携带之前轮次的反思原文（可选），
+        供多轮反思闭环使用；None/空列表时行为同 v6.3。
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -82,8 +132,10 @@ class StubAdapter(ModelAdapter):
     def generate_struct(self, schema: Type[T], prompt: str, **kw: Any) -> Optional[T]:
         return None  # caller falls back to free-form prompt
 
-    def reflect(self, field_label: str, field_value: Any, ctx: dict) -> str:
+    def reflect(self, field_label: str, field_value: Any, ctx: dict,
+                prior_reflections: Optional[list] = None) -> str:
         # v5.0 behaviour: stub returns "" = "no objection"
+        # v6.4 (R6-A1): prior_reflections 对 stub 无意义（无 LLM 可回喂）
         return ""
 
     def is_live(self) -> bool:
@@ -102,6 +154,9 @@ class OpenAICompatibleAdapter(ModelAdapter):
     Each retry appends the error message to the next prompt so the model can
     self-correct. Final failure returns "" and logs a warning — same as v6.0
     behaviour, just with attempt count visible.
+
+    v6.4 (R6-A1): `reflect()` accepts `prior_reflections` — 多轮反思时后续轮次
+    的 prompt 携带之前轮次的反思原文（修复反思原文从不回喂的 near-no-op 缺陷）。
 
     Environment variables (read at __init__ time):
       - LLM_BASE_URL: e.g. https://api.openai.com/v1
@@ -177,6 +232,14 @@ class OpenAICompatibleAdapter(ModelAdapter):
             # instructor missing — generate_struct() falls back to plain JSON mode
             self._instructor_client = None
 
+        # v6.4 (R6-A2): optional json-repair — 缺失时 generate_struct 行为同 v6.3
+        self._json_repair = None
+        try:
+            import json_repair
+            self._json_repair = json_repair
+        except ImportError:
+            self._json_repair = None
+
     def generate_struct(self, schema: Type[T], prompt: str, **kw: Any) -> Optional[T]:
         """Pydantic-validated generation via instructor; falls back to plain chat if unavailable.
 
@@ -184,8 +247,15 @@ class OpenAICompatibleAdapter(ModelAdapter):
         validation failure doesn't immediately give up. Instructor internally also
         retries (max_retries=2), but the outer loop catches cases where instructor
         itself raises (timeout, BadRequestError, etc).
+
+        v6.4 (R6-A2): 重试前把校验失败格式化为反馈块（`_format_validation_feedback`）
+        追加进 prompt，让下一轮 attempt 的 messages 携带错误详情自修正。
+        首次 attempt（无任何失败）发送的 prompt 与 v6.3 逐字节相同——反馈块只在
+        失败后的重试追加。plain 分支在 `json_repair` 可用时先宽松修复再严格校验；
+        `json_repair` 缺失时行为同 v6.3（原样 raise → 走外层重试）。
         """
-        for attempt in range(max(1, self.max_retries)):
+        total_attempts = max(1, self.max_retries)
+        for attempt in range(total_attempts):
             messages = [{"role": "user", "content": prompt}]
             if self._instructor_client is not None:
                 try:
@@ -198,9 +268,12 @@ class OpenAICompatibleAdapter(ModelAdapter):
                     )
                 except Exception as exc:  # noqa: BLE001
                     print(
-                        f"⚠️ LLM generate_struct attempt {attempt+1}/{self.max_retries} failed: {exc}",
+                        f"⚠️ LLM generate_struct attempt {attempt+1}/{total_attempts} failed: {exc}",
                         file=sys.stderr,
                     )
+                    # v6.4 (R6-A2): 若还有剩余 attempt，把校验错误回喂进 prompt 再重试
+                    if attempt + 1 < total_attempts:
+                        prompt = f"{prompt}\n\n{_format_validation_feedback(exc)}"
                     # Continue to next retry iteration
                     continue
             # Plain OpenAI fallback (no schema enforcement)
@@ -212,27 +285,47 @@ class OpenAICompatibleAdapter(ModelAdapter):
                     **kw,
                 )
                 raw = resp.choices[0].message.content
-                return schema.model_validate_json(raw)
+                try:
+                    return schema.model_validate_json(raw)
+                except Exception:
+                    # v6.4 (R6-A2): 严格解析失败 → json_repair 可用则修复后再校验；
+                    # 不可用（或修复后仍不合法）时原样抛给外层重试逻辑（v6.3 行为）
+                    if self._json_repair is None:
+                        raise
+                    repaired = self._json_repair.loads(raw)
+                    return schema.model_validate(repaired)
             except Exception as exc:  # noqa: BLE001
                 print(
-                    f"⚠️ LLM generate_struct (plain) attempt {attempt+1}/{self.max_retries} failed: {exc}",
+                    f"⚠️ LLM generate_struct (plain) attempt {attempt+1}/{total_attempts} failed: {exc}",
                     file=sys.stderr,
                 )
+                # v6.4 (R6-A2): 同 instructor 分支——剩余 attempt 时回喂错误反馈
+                if attempt + 1 < total_attempts:
+                    prompt = f"{prompt}\n\n{_format_validation_feedback(exc)}"
                 continue
         # All retries exhausted
         print(
-            f"⚠️ LLM generate_struct exhausted {self.max_retries} attempts; returning None",
+            f"⚠️ LLM generate_struct exhausted {total_attempts} attempts; returning None",
             file=sys.stderr,
         )
         return None
 
-    def reflect(self, field_label: str, field_value: Any, ctx: dict) -> str:
+    def reflect(self, field_label: str, field_value: Any, ctx: dict,
+                prior_reflections: Optional[list] = None) -> str:
         """Single-field self-critique with retry-on-failure (v6.2 R4-A1).
 
         Up to `max_retries` attempts (default 2). On each failure (BadRequestError,
         BadResponseError, empty response, JSON decode error), append the error to
         the prompt for the next attempt: "上一次回答出错: {err}\n请重新回答。"
         Final failure returns "" and logs "reflect exhausted" to stderr.
+
+        v6.4 (R6-A1): `prior_reflections` 反馈闭环——调用方（fill_docx.py 的多轮
+        反思循环）把之前轮次的反思原文回喂进来。非空时（仅取最后 3 条）在
+        base_prompt 末尾追加「之前轮次的反思记录」块，让模型在既有反思基础上
+        重新审计，而不是从零重复同一个任务。`prior_reflections` 为 None/空列表时
+        prompt 与 v6.3 逐字节相同（历史行为硬约束）。
+        注意：SKILL.md 承诺的「重新调用 Step 5 用反思重生成」仍未实现（future
+        work）——本参数只让多轮反思任务递进，不触发现值重生成。
 
         Back-compat: when `max_retries=0`, behaves identically to v6.0 (single call,
         log + return "" on failure). When `max_retries>=1`, adds retry semantics.
@@ -245,6 +338,13 @@ class OpenAICompatibleAdapter(ModelAdapter):
             f"同表已填字段:\n{ctx_lines}\n"
             "请回答 (≤2 句):"
         )
+        # v6.4 (R6-A1): 多轮反思闭环——把之前轮次的反思原文（最后 3 条）回喂 prompt
+        if prior_reflections:
+            prior_block = "\n".join(f"- {r}" for r in prior_reflections[-3:])
+            base_prompt += (
+                f"\n\n之前轮次的反思记录:\n{prior_block}\n"
+                "请在上述反思基础上重新审计该字段。"
+            )
         # max_retries=0 → single attempt (v6.0 behaviour)
         # max_retries=N → up to N+1 total attempts (1 initial + N retries)
         attempts = max(1, self.max_retries + 1)
@@ -334,8 +434,12 @@ class MockLLMAdapter(ModelAdapter):
             file=sys.stderr,
         )
 
-    def reflect(self, field_label: str, field_value: Any, ctx: dict) -> str:
-        """Return canned response keyed by label (exact → substring → miss)."""
+    def reflect(self, field_label: str, field_value: Any, ctx: dict,
+                prior_reflections: Optional[list] = None) -> str:
+        """Return canned response keyed by label (exact → substring → miss).
+
+        v6.4 (R6-A1): prior_reflections 不影响 mock 查表（确定性替身）。
+        """
         # Exact label match first
         if field_label in self.canned_responses:
             return self.canned_responses[field_label]

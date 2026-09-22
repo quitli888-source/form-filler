@@ -12,6 +12,7 @@ pyyaml>=6.0               # YAML 配置文件读写
 pydantic>=2.0             # 字段约束类型系统
 openai>=1.0,<2.0          # OpenAI 兼容 SDK（covers OpenAI / minimax m3 / DeepSeek / Qwen ...）
 instructor>=1.0           # Pydantic-validated structured outputs
+json-repair>=0.30         # optional; 缺失时 generate_struct 行为同 v6.3（无宽松修复层）
 
 # ----- Optional: PDF / OCR / Excel (per SKILL.md §工具集成指南) -----
 # openpyxl

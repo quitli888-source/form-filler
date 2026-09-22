@@ -60,6 +60,21 @@ except Exception:  # defensive — should not happen in normal env
     def is_jinja_template(docx_path):  # type: ignore
         return False
 
+# v6.4 (R6-A3): 确定性字段类型推断（纯标准库，introspect JSON 的 type/required/empty）
+try:
+    from field_types import (  # noqa: E402
+        infer_field_type,
+        is_required_label,
+        is_empty_value,
+    )
+except Exception:  # defensive — field_types.py 是纯标准库，正常不会失败
+    def infer_field_type(label, value):  # type: ignore
+        return "text"
+    def is_required_label(label):  # type: ignore
+        return False
+    def is_empty_value(value):  # type: ignore
+        return not (value or "").strip()
+
 # 可选依赖：pydantic + schemas（缺失则降级到 v5.0 行为）
 try:
     from evaluation.schemas import (  # noqa: E402
@@ -130,6 +145,11 @@ def scan_docx_introspect(doc_path: str) -> dict:
 
     用途：供下游 Schema 选择 / Round 3+ 自动化回归测试使用。
     不依赖任何运行时状态；纯静态扫描。
+
+    v6.4 (R6-A3): 每个 cell dict 新增 `type` / `required` / `empty` 三键
+    （additive，既有键 text/is_label/merged_dup 不动；merged_dup 分支同步补
+    三键保持 schema 一致）。type 由 scripts/field_types.py 确定性推断，
+    不经过 LLM，可复现、可 diff。
     """
     doc = Document(doc_path)
     tables_data = []
@@ -141,7 +161,12 @@ def scan_docx_introspect(doc_path: str) -> dict:
             for ci, cell in enumerate(row.cells):
                 cell_id = id(cell._tc)
                 if cell_id in seen_cells:
-                    cells.append({"row": ri, "col": ci, "text": "", "is_label": False, "merged_dup": True})
+                    cells.append({
+                        "row": ri, "col": ci, "text": "", "is_label": False,
+                        "merged_dup": True,
+                        # v6.4 (R6-A3): merged_dup 与普通 cell 保持同一 schema
+                        "type": "text", "required": False, "empty": True,
+                    })
                     continue
                 seen_cells.add(cell_id)
                 text = cell.text.strip()
@@ -149,6 +174,10 @@ def scan_docx_introspect(doc_path: str) -> dict:
                     "row": ri, "col": ci, "text": text,
                     "is_label": _is_likely_label(text),
                     "merged_dup": False,
+                    # v6.4 (R6-A3): 确定性类型/必填/空值标注（additive）
+                    "type": infer_field_type(text, text),
+                    "required": is_required_label(text),
+                    "empty": is_empty_value(text),
                 })
             rows.append(cells)
         tables_data.append({
@@ -211,9 +240,31 @@ def _redact_label(label: str) -> bool:
     return any(k in label for k in ("手机", "邮箱", "身份证", "银行卡"))
 
 
+# v6.4 (R6-A3): _is_likely_label hardening — 数值/单位值（"6个月" "1万元" 类）
+# 是待填写值而非标签；与 field_types._AMOUNT_UNIT_RE 同族但单位表更宽。
+_LABEL_UNIT_VALUE_RE = re.compile(
+    r"^\d+(?:\.\d+)?\s*(?:万元|亿元|元|块钱|个月|月|人|个|名|位|年|天|日|次|件|条|张|份|台|部|间|%|％)$"
+)
+# v6.4 (R6-A3): _is_likely_label hardening — 说明语句（"……请依次填写" "……如下" 类）
+# 是模板提示语而非字段标签。
+_LABEL_INSTRUCTION_TAIL_RE = re.compile(r"请依次填写|请填写|请按照|如下")
+
+
 def _is_likely_label(text: str) -> bool:
-    """判断单元格文本是否是字段标签（而非待填写值）"""
+    """判断单元格文本是否是字段标签（而非待填写值）
+
+    v6.4 (R6-A3) hardening: 在关键词匹配前增加两条排除——
+      1. 数值/单位值（"6个月" "1万元" 类）→ False；
+      2. 说明语句（"……请依次填写" "……如下" 类）→ False。
+    其余行为与 v6.3 逐字节一致（既有 label_patterns 不动）。
+    """
     if len(text) > 20:
+        return False
+    # v6.4 (R6-A3): 排除 1——数值/单位值是待填写值
+    if _LABEL_UNIT_VALUE_RE.match(text):
+        return False
+    # v6.4 (R6-A3): 排除 2——说明语句是模板提示语
+    if _LABEL_INSTRUCTION_TAIL_RE.search(text):
         return False
     # 常见表格标签关键词
     label_patterns = [
@@ -764,13 +815,21 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
     9. (v6.3 R5-A1) 若模板含 `{{ var }}` Jinja2 标签，则切换 jinja 模式，按标签直接取值
     10. (v6.3 R5-A3) XML 迭代失败时在 audit["warnings"] 写入结构化警告
     11. 保存结果
+    12. (v6.4 R6-A1) reflexion_rounds≥2 时，后续轮次的反思 prompt 携带之前轮次的
+        反思原文（prior_reflections 回喂），使多轮反思任务递进而非重复
 
     reflexion_rounds: 自检反思轮数（0 = 关闭，1 = 推荐）。每轮会调用 adapter.reflect()，
                       反思非空则把反思写入 audit entry 并把状态降级为 ⚠️。
+                      v6.4 (R6-A1): N≥2 时第 k 轮（k≥2）的反思 prompt 会附带前 k-1 轮
+                      的反思原文（adapter 侧仅取最后 3 条）。
     profile_md_dir: 若提供，则调用 write_profile_md() 把 profile.md 写到该目录
                     （默认建议 = output DOCX 同目录，避免污染 profiles/）。
     profile_counter_dir: 计数器文件目录（默认 profiles/），仅持久化版本号 N。
     _reflect_impl: 可选，注入测试替身；缺省使用 adapter.reflect()。
+                   v6.4 (R6-A1) 起契约为 4 参：
+                   reflect_fn(label, value, ctx, prior_reflections)，
+                   其中 prior_reflections 为之前轮次反思原文列表（首轮为 []）；
+                   旧 3 参替身会因缺参 TypeError——测试替身需同步加 `prior_reflections=None`。
     adapter: 可选，注入 ModelAdapter 实例；缺省 = StubAdapter()（v5.0 行为）。
     schema_ai_generate: 当 AI 生成字段（📝）匹配到一个 Pydantic schema 时，
                        是否尝试用 adapter.generate_struct() 生成受约束的内容；
@@ -791,7 +850,10 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
     if adapter is None:
         adapter = StubAdapter()
     reflect_fn = _reflect_impl if _reflect_impl is not None else (
-        lambda lbl, val, ctx: adapter.reflect(lbl, val, {"filled_so_far": ctx})
+        # v6.4 (R6-A1): 4 参契约——prior 回喂之前轮次的反思原文（首轮为 []）
+        lambda lbl, val, ctx, prior=None: adapter.reflect(
+            lbl, val, {"filled_so_far": ctx}, prior_reflections=prior
+        )
     )
 
     # v6.3 R5-A1: detect Jinja2 tags and switch mode
@@ -869,13 +931,17 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                 filled_so_far = {
                     d["label"]: d["value"] for d in audit["details"] if d.get("value")
                 }
+                # v6.4 (R6-A1): 多轮反思闭环——prior_reflections 收集已产出的反思原文，
+                # 回喂给下一轮 reflect 调用（修复"反思原文从不回喂"的 near-no-op 缺陷）
+                prior_reflections: list = []
                 for _ in range(reflexion_rounds):
-                    r = reflect_fn(text, filled_value, filled_so_far)
+                    r = reflect_fn(text, filled_value, filled_so_far, prior_reflections)
                     if not r:
                         break  # stub: nothing to reflect on
                     reflection_text = r
                     status_icon = "⚠️"
                     filled_so_far[text] = filled_value
+                    prior_reflections.append(r)
             elif skip_llm and reflexion_rounds > 0 and filled_value:
                 # Record the deterministic skip in the audit
                 reflection_text = "[skip-llm: literal]"
