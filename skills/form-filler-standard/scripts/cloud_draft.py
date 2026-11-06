@@ -15,9 +15,10 @@ import sys
 import time
 from pathlib import Path
 
-from privacy import PrivacyError, endpoint_url, private_text, utf8_console
+from privacy import PrivacyError, endpoint_url, private_text, utf8_console, scoped_log_guard
 
 MAX_BYTES = 32_768
+MAX_RESPONSE_BYTES = 1_048_576
 
 
 def canonical(value: dict) -> bytes:
@@ -62,19 +63,26 @@ def prepare_request(prompt: str, base_url: str, model: str, out_path, *, now=Non
                "body": {"model": model, "messages": [{"role": "user", "content": prompt}]},
                "created_at": now, "expires_at": now + 600, "nonce": os.urandom(16).hex()}
     validate_request(request, now)
-    private_text(out_path, json.dumps(request, ensure_ascii=False, indent=2))
+    serialized = json.dumps(request, ensure_ascii=False, indent=2)
+    if len(serialized.encode("utf-8")) > MAX_BYTES:
+        raise PrivacyError("Prepared request exceeds its on-disk size limit.")
+    private_text(out_path, serialized)
     return request_digest(request)
 
 
+@scoped_log_guard
 def send_request(request_path, approved_sha256: str, response_path, *, now=None) -> None:
     request_path = Path(request_path)
-    if request_path.resolve() == Path(response_path).resolve():
+    used = request_path.with_name(request_path.name + ".used")
+    if Path(response_path).resolve() in (request_path.resolve(), used.resolve()):
         raise PrivacyError("Response must not overwrite the prepared request.")
     if Path(response_path).exists():
         raise PrivacyError("Use a fresh local response filename.")
-    if request_path.stat().st_size > MAX_BYTES:
+    with request_path.open("rb") as source:
+        raw_request = source.read(MAX_BYTES + 1)
+    if len(raw_request) > MAX_BYTES:
         raise PrivacyError("Prepared request is too large.")
-    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request = json.loads(raw_request.decode("utf-8"))
     validate_request(request, time.time() if now is None else now)
     digest = request_digest(request)
     if not hmac.compare_digest(digest, approved_sha256):
@@ -83,23 +91,31 @@ def send_request(request_path, approved_sha256: str, response_path, *, now=None)
     if not key or any(c in key for c in "\r\n"):
         raise PrivacyError("Set FORM_FILLER_CLOUD_API_KEY privately; no command-line keys.")
     # Exclusive marker prevents accidental replay/concurrent duplicate sends. No body in marker.
-    used = request_path.with_name(request_path.name + ".used")
+    # Import before consuming the request: a missing optional dependency sends nothing.
+    import httpx
     try:
         fd = os.open(used, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         raise PrivacyError("Prepared request already consumed; prepare and review again.") from None
     with os.fdopen(fd, "w", encoding="ascii") as stream:
         stream.write(digest)
-    import httpx
     try:
         # No implicit proxy, redirects, SDK retry, file uploads, or tools.
         with httpx.Client(trust_env=False, follow_redirects=False, timeout=30.0) as client:
-            response = client.post(request["endpoint"] + "/chat/completions",
-                                   content=canonical(request["body"]),
-                                   headers={"Authorization": "Bearer " + key,
-                                            "Content-Type": "application/json"})
-            response.raise_for_status()
-            payload = response.json()
+            with client.stream("POST", request["endpoint"] + "/chat/completions",
+                               content=canonical(request["body"]),
+                               headers={"Authorization": "Bearer " + key,
+                                        "Content-Type": "application/json",
+                                        "Accept-Encoding": "identity"}) as response:
+                response.raise_for_status()
+                if response.headers.get("content-encoding", "identity").lower() != "identity":
+                    raise PrivacyError("Compressed cloud responses are not accepted.")
+                body = bytearray()
+                for chunk in response.iter_bytes(chunk_size=16_384):
+                    if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+                        raise PrivacyError("Cloud response exceeds the local size limit.")
+                    body.extend(chunk)
+                payload = json.loads(body.decode("utf-8"))
             content = payload["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 raise PrivacyError("Cloud response has no text draft.")
@@ -112,27 +128,15 @@ def send_request(request_path, approved_sha256: str, response_path, *, now=None)
 def main():
     parser = argparse.ArgumentParser(description="Review-bound cloud drafting (no automatic profile access)")
     sub = parser.add_subparsers(dest="command", required=True)
-    prepare = sub.add_parser("prepare")
-    prepare.add_argument("--prompt-file", required=True)
-    prepare.add_argument("--base-url", required=True)
-    prepare.add_argument("--model", required=True)
-    prepare.add_argument("--out", required=True)
+    # All CLI preparation goes through standard_workflow.py's local deidentifier.
     send = sub.add_parser("send")
     send.add_argument("--request", required=True)
     send.add_argument("--approved-sha256", required=True)
     send.add_argument("--response-out", required=True)
     args = parser.parse_args()
     try:
-        if args.command == "prepare":
-            if Path(args.prompt_file).stat().st_size > MAX_BYTES:
-                raise PrivacyError("Prompt file is too large.")
-            digest = prepare_request(Path(args.prompt_file).read_text(encoding="utf-8"),
-                                     args.base_url, args.model, args.out)
-            print("Prepared offline. Review exact endpoint, model and prompt in the local request.")
-            print("Approval SHA-256: " + digest)
-        else:
-            send_request(args.request, args.approved_sha256, args.response_out)
-            print("Cloud attempt completed; draft saved locally for review.")
+        send_request(args.request, args.approved_sha256, args.response_out)
+        print("Cloud attempt completed; draft saved locally for review.")
     except Exception:
         print("Cloud operation blocked or failed; details withheld. Check local request and approval.", file=sys.stderr)
         return 1

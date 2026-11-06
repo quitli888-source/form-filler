@@ -13,3 +13,7 @@ Windows档案位于FormFillerPrivate，使用当前用户DPAPI，不启用LOCAL_
 删除只限用户指定任务范围，不声称能彻底清除内存、交换文件、SSD、编辑器缓存、同步备份或系统记录。
 
 参考：[DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)、[HTTPX环境变量](https://www.python-httpx.org/environment_variables/)、[重定向](https://www.python-httpx.org/compatibility/#redirects)。
+
+模型调用期间的openai/httpx/httpcore标准logging记录会在交给handler前遮盖消息与异常正文，即使OPENAI_LOG=debug。调用结束恢复原日志factory，非模型日志不受影响；这不能控制第三方自定义print或宿主遥测。
+
+已有加密档案默认拒绝覆盖；--replace-section明确替换整个section而非合并。目标目录有同类明文时先拒绝，避免同时生成两种格式后无法读取。源文件仍保留，不自动迁移或删除。

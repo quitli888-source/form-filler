@@ -16,3 +16,11 @@
 任务文件保留用于本地审核，结束告知生成副本，由用户决定清理；不自动删原件，不承诺擦除SSD、缓存、备份和服务端记录。宿主云端读取本地原文也属于披露，本机模型服务也可能转发云端，需用户控制。
 
 技术参考：[HTTPX代理](https://www.python-httpx.org/environment_variables/)、[HTTPX重定向](https://www.python-httpx.org/compatibility/#redirects)、[DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)。
+
+模型调用期间的openai/httpx/httpcore标准logging记录会在交给handler前遮盖消息与异常正文，即使OPENAI_LOG=debug。调用结束恢复原日志factory，非模型日志不受影响；这不能控制第三方自定义print或宿主遥测。
+
+已有加密档案默认拒绝覆盖；--replace-section明确替换整个section而非合并。目标目录有同类明文时先拒绝，避免同时生成两种格式后无法读取。源文件仍保留，不自动迁移或删除。
+
+allow_cloud=false素材可仅在本地帮助发现应遮盖的身份词，以便已选素材中相同词也被替换；未选原文及语义不进入模型facts或basis。所有已知词先收集后统一替换，处理空格/横线/零宽字符分隔的常见号码，并检查完整请求，仍不保证未知身份完全匿名。
+
+命令行准备只走standard_workflow.py；不再提供cloud_draft.py prepare原始prompt入口。云端响应流式限制1MiB，超限停止并消耗本次请求，不保存内容或自动重试。

@@ -14,7 +14,7 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Type, TypeVar
-from privacy import PrivacyError, endpoint_url
+from privacy import PrivacyError, endpoint_url, scoped_log_guard
 
 T = TypeVar("T")
 
@@ -120,6 +120,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
 
     name = "openai-compatible"
 
+    @scoped_log_guard
     def __init__(
         self,
         base_url: Optional[str] = None,
@@ -197,6 +198,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
         except ImportError:
             self._json_repair = None
 
+    @scoped_log_guard
     def generate_struct(self, schema: Type[T], prompt: str, **kw: Any) -> Optional[T]:
         """Pydantic-validated generation via instructor; falls back to plain chat if unavailable.
 
@@ -267,6 +269,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
         )
         return None
 
+    @scoped_log_guard
     def reflect(self, field_label: str, field_value: Any, ctx: dict,
                 prior_reflections: Optional[list] = None) -> str:
         """Single-field self-critique with retry-on-failure (v6.2 R4-A1).

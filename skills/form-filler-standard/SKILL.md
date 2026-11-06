@@ -2,7 +2,7 @@
 name: form-filler-standard
 description: 常态版填表助手。根据本地资料填表，允许外部模型基于脱敏素材合理推测信息、生成内容并在本地填写。普通填表使用本版，要求绝对隐私或全程本地时使用 form-filler-private。
 metadata:
-  version: "8.0.0"
+  version: "8.0.1"
   edition: "standard"
 ---
 
@@ -46,3 +46,5 @@ python scripts/fill_docx.py --template <模板.docx> --profile-dir <已有资料
 
 Python执行器仅实现DOCX表格，不是完整Jinja渲染器；Excel/PDF使用本地openpyxl/PyMuPDF，扫描件用已有离线OCR，缺依赖先说明下载需求，不改传在线转换/OCR服务。
 更多限制见 [隐私边界](references/privacy.md)。
+
+实际写格只接受规范字段或显式同义词，并且只写空白单元格；已有文本、图片、域与嵌套表格保留，不识别的标签留待处理。非法枚举不填入；学历年级基于明确学历及合法入学日期计算，不从学历猜申报类别。默认审计模板不依赖调用工作目录，scan-only无需档案或模型。

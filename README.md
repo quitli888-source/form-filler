@@ -1,4 +1,4 @@
-# Form Filler v8 — 双版本填表 Skill
+# Form Filler v8.0.1 — 双版本填表 Skill
 
 两种可独立安装的版本：严格本地的绝对隐私版，以及支持脱敏云端推测和写作的常态版。
 
@@ -39,7 +39,22 @@ pip install -r requirements-model.txt
 
 ## 验证
 
-两版分别运行测试，避免同名Python模块混入另一版本：
+从仓库根目录一次验证两版，各版测试在独立Python进程和独立工作目录运行，避免同名模块混入另一版：
+
+```powershell
+python tools/check_editions.py
+# 只检查某一版
+python tools/check_editions.py --edition private
+```
+
+检查同时核对dist安装包与受控源码范围、ZIP完整性及SHA-256。源码改动后用以下命令重新打包；固定文件顺序、时间戳及文本换行，同样的源码生成相同ZIP。真实档案、密钥配置、缓存和临时输出不在打包白名单内：
+
+```powershell
+python tools/manage_packages.py build
+python tools/manage_packages.py check
+```
+
+维护工具需要所选版本的开发依赖。也可以在各版本目录单独运行：
 
 ```powershell
 # 进入所选skills/form-filler-private或skills/form-filler-standard目录
@@ -47,7 +62,9 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-本次验证：绝对隐私版141 passed、1 skipped；常态版175 passed、1 skipped。全部测试采用合成数据并禁止socket联网，云端模型响应模拟；Windows实际DPAPI加解密往返通过，两个SKILL格式检查通过。
+根目录的`python -m pytest`只运行轻量维护检查，不收集旧版tests或混合两版测试；完整回归使用`tools/check_editions.py`。
+
+本次验证：绝对隐私版168 passed、1 skipped；常态版221 passed、1 skipped；根维护检查8 passed。全部测试采用合成数据并禁止socket联网，云端模型响应模拟；Windows实际DPAPI加解密往返通过，两个SKILL格式检查通过。
 Python执行器支持DOCX表格；Excel/PDF/OCR为本地agent流程，不代表完整多格式执行器。安装包校验见[SHA-256](dist/SHA256SUMS.txt)。
 
 仓库根目录原有scripts/evaluation/tests/agent_state为旧版兼容/历史资料；v8使用skills下的独立实现，根SKILL只负责路由，不执行旧版流程。MIT License。

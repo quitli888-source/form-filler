@@ -41,7 +41,7 @@ def test_cloud_approval_is_bound_to_exact_unexpired_request(prepared, case):
         else:
             body["body"]["model"] = "another-model"
         private_text(request, json.dumps(body))
-    with patch.object(httpx.Client, "post") as network:
+    with patch.object(httpx.Client, "stream") as network:
         with pytest.raises(PrivacyError):
             send_request(request, digest, output, now=now)
         network.assert_not_called()
@@ -94,4 +94,59 @@ def test_cloud_prepare_preserves_existing_local_files(prepared):
     with pytest.raises(PrivacyError):
         prepare_request("A different request", "https://provider.example/v1", "model", path, now=1001)
     assert path.read_bytes() == before
+
+
+def test_cloud_response_limit_consumes_attempt_without_saving(prepared):
+    from cloud_draft import MAX_RESPONSE_BYTES
+    request, digest, output = prepared
+    real_client = httpx.Client
+    seen = []
+    def reply(req):
+        seen.append(req)
+        return httpx.Response(200, content=b"x" * (MAX_RESPONSE_BYTES + 1))
+    with patch.object(httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(reply), **kw)):
+        with pytest.raises(PrivacyError):
+            send_request(request, digest, output, now=1001)
+    assert len(seen) == 1
+    assert not output.exists()
+    assert request.with_name(request.name + ".used").exists()
+
+
+def test_response_cannot_replace_replay_marker(prepared):
+    request, digest, _ = prepared
+    marker = request.with_name(request.name + ".used")
+    with patch.object(httpx.Client, "stream") as network:
+        with pytest.raises(PrivacyError):
+            send_request(request, digest, marker, now=1001)
+        network.assert_not_called()
+    assert not marker.exists()
+
+
+def test_cloud_cli_has_no_raw_prompt_preparation(monkeypatch):
+    from cloud_draft import main
+    monkeypatch.setattr(sys, "argv", ["cloud_draft.py", "prepare"])
+    with patch.object(httpx.Client, "stream") as network:
+        with pytest.raises(SystemExit) as error:
+            main()
+        assert error.value.code == 2
+        network.assert_not_called()
+
+
+def test_compressed_body_is_rejected_without_reading_it(prepared):
+    request, digest, output = prepared
+    real_client = httpx.Client
+    reads = []
+    class UnreadableCompressedBody(httpx.SyncByteStream):
+        def __iter__(self):
+            reads.append(True)
+            raise AssertionError("Compressed body must not be read")
+            yield b""
+    def reply(req):
+        assert req.headers["accept-encoding"] == "identity"
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=UnreadableCompressedBody())
+    with patch.object(httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(reply), **kw)):
+        with pytest.raises(PrivacyError):
+            send_request(request, digest, output, now=1001)
+    assert reads == []
+    assert not output.exists()
 

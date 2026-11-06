@@ -1,4 +1,4 @@
-# Form Filler 绝对隐私版（严格本地）v8
+# Form Filler 绝对隐私版（严格本地）v8.0.1
 
 独立skill：form-filler-private。默认本地规则，可选真正本机模型；没有云端发送器，脱敏素材也不发外部模型。本版与常态版可以同时安装，资料目录隔离。
 
@@ -26,3 +26,5 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 全用合成资料，测试禁止socket联网。
+
+本次修复：保留预填单元格与已有格式；scan-only不依赖档案或模型；审计模板按安装位置查找。SDK调试日志中的模型调用正文也会隐藏。已有加密section不默认覆盖，确需替换整个section时显式使用--replace-section。

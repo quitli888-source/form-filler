@@ -4,6 +4,10 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import contextvars
+import functools
+import logging
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from edition import EDITION, DATA_NAMESPACE, POSIX_NAMESPACE
@@ -11,6 +15,38 @@ from edition import EDITION, DATA_NAMESPACE, POSIX_NAMESPACE
 
 class PrivacyError(ValueError):
     """A safe-to-display error; never include user data in its message."""
+
+
+_log_scope = contextvars.ContextVar("form_filler_private_diagnostics", default=False)
+_log_lock = threading.RLock()
+
+
+def scoped_log_guard(function):
+    """Hide this call's SDK diagnostics even when OPENAI_LOG=debug is set.
+
+    Scrub records before handlers see them, without changing logger levels,
+    credentials, or unrelated callers' messages. Restore the previous factory.
+    This covers standard logging, not arbitrary third-party print statements.
+    """
+    @functools.wraps(function)
+    def guarded(*args, **kwargs):
+        with _log_lock:
+            previous = logging.getLogRecordFactory()
+            token = _log_scope.set(True)
+            def factory(*a, **kw):
+                record = previous(*a, **kw)
+                if _log_scope.get() and record.name.split(".")[0] in {"openai", "httpx", "httpcore"}:
+                    record.msg, record.args = "[model diagnostics withheld]", ()
+                    record.exc_info = record.exc_text = record.stack_info = None
+                return record
+            logging.setLogRecordFactory(factory)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                if logging.getLogRecordFactory() is factory:
+                    logging.setLogRecordFactory(previous)
+                _log_scope.reset(token)
+    return guarded
 
 
 def local_data_dir() -> Path:

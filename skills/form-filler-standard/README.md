@@ -1,4 +1,4 @@
-# Form Filler 常态版 v8
+# Form Filler 常态版 v8.0.1
 
 允许外部模型使用选定、经本地脱敏的素材做合理推测、文本生成，再在本机还原身份与填表。独立skill名form-filler-standard，与严格版可同时安装且档案目录分开。
 
@@ -36,3 +36,5 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 全用合成资料、模拟模型响应，禁止socket联网。
+
+本次修复：保留预填单元格与已有格式；scan-only不依赖档案或模型；审计模板按安装位置查找。SDK调试日志中的模型调用正文也会隐藏。已有加密section不默认覆盖，确需替换整个section时显式使用--replace-section。

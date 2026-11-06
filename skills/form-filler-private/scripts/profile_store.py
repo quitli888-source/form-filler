@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from privacy import PrivacyError, local_data_dir, private_write, utf8_console
+from privacy import PrivacyError, local_data_dir, private_write, protect_inputs, utf8_console
 
 SECTIONS = {"personal", "contact", "education", "awards", "work_experience",
             "publications", "skills", "league", "bank"}
@@ -53,12 +53,18 @@ def _dpapi(data: bytes, *, decrypt: bool) -> bytes:
             kernel.LocalFree(target.pbData)
 
 
-def save_section(directory, section: str, data: dict) -> None:
+def save_section(directory, section: str, data: dict, *, replace: bool = False) -> None:
     if section not in SECTIONS or not isinstance(data, dict):
         raise PrivacyError("Unknown profile section or invalid mapping.")
+    directory = Path(directory)
+    destination = directory / (section + ".yaml.dpapi")
+    if destination.exists() and not replace:
+        raise PrivacyError("Section already exists; replacement requires an explicit choice.")
+    if any((directory / (section + suffix)).exists() for suffix in (".yaml", ".yml")):
+        raise PrivacyError("Plaintext section already exists here; choose a separate encrypted directory.")
     raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
     encrypted = _dpapi(raw, decrypt=False)
-    private_write(Path(directory) / (section + ".yaml.dpapi"), encrypted)
+    private_write(destination, encrypted)
 
 
 def read_section(path) -> dict:
@@ -94,10 +100,13 @@ def main():
     parser.add_argument("--source", required=True, help="Local YAML mapping containing ONLY the section to retain")
     parser.add_argument("--section", required=True, choices=sorted(SECTIONS))
     parser.add_argument("--profile-dir", default=str(local_data_dir() / "profiles"))
+    parser.add_argument("--replace-section", action="store_true", help="Explicitly replace this entire stored section; no automatic merge")
     args = parser.parse_args()
     try:
+        destination = Path(args.profile_dir) / (args.section + ".yaml.dpapi")
+        protect_inputs([destination], [args.source])
         data = yaml.safe_load(Path(args.source).read_text(encoding="utf-8"))
-        save_section(args.profile_dir, args.section, data)
+        save_section(args.profile_dir, args.section, data, replace=args.replace_section)
         print("Section encrypted locally. Source file was preserved; review and remove it yourself if appropriate.")
     except Exception:
         print("Profile import failed; details withheld. No plaintext fallback.", file=sys.stderr)

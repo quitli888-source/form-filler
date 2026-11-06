@@ -158,7 +158,7 @@ def scan_docx_introspect(doc_path: str) -> dict:
         "scanned_at": datetime.now().isoformat(timespec="seconds"),
         "tables": tables_data,
         "labels": [
-            {"table": ti, "row": f["row"], "col": f["col"], "text": f["text"]}
+            {"table": f["table"], "row": f["row"], "col": f["col"], "text": f["text"]}
             for f in [
                 {"table": ti, "row": ri, "col": ci, "text": safe_label(text) if _is_likely_label(text) else "[已隐藏]", "is_label": _is_likely_label(text)}
                 for ti, table in enumerate(doc.tables)
@@ -249,6 +249,27 @@ def _is_likely_label(text: str) -> bool:
     return False
 
 
+
+_FILL_LABEL_DECORATIONS = re.compile(
+    r"[（(](?:必填|选填|可选|中文|英文|拼音|正楷|真实姓名|11位|18位|YYYY[-/]MM(?:[-/]DD)?)[)）]",
+    re.IGNORECASE,
+)
+
+
+def _fillable_label(text: str) -> Optional[str]:
+    """Accept exact schema names/explicit aliases for writes, never substrings.
+
+    Inspection may suggest more possible labels; actual writes deliberately
+    require a known field after harmless spacing/required-marker normalization.
+    """
+    label = re.sub(r"\s+", "", text)
+    label = _FILL_LABEL_DECORATIONS.sub("", label).strip(":：*＊※★")
+    canonical = SCHEMA_SYNONYMS.get(label, label)
+    canonical = {"学历": "最高学历", "年级": "学历年级"}.get(canonical, canonical)
+    known = {name for schema in SCHEMAS.values() for name in schema.model_fields}
+    known.update(("学历", "年级", "所在单位", "申报类别"))
+    return canonical if canonical in known else None
+
 def _get_nested_value(data: dict, path: str):
     """按点分路径获取嵌套字典值，如 entries.0.student_id"""
     keys = path.split(".")
@@ -267,18 +288,32 @@ def _get_nested_value(data: dict, path: str):
 
 
 def _compute_grade(profiles: dict) -> str:
-    """从入学年份+学位推断年级"""
-    edu = profiles.get("education", {})
-    entries = edu.get("entries", [])
-    if not entries:
+    """Build a cohort label only from an explicit supported degree and valid date."""
+    from datetime import date
+    entries = (profiles.get("education", {}) or {}).get("entries", [])
+    if not entries or not isinstance(entries[0], dict):
         return None
     entry = entries[0]
-    start_date = entry.get("start_date", "")
-    degree = entry.get("degree", "")
-    if start_date and degree:
-        year = start_date.split("-")[0]
-        return f"{year[2:]}级{degree}生"
-    return None
+    degree = entry.get("degree")
+    if degree not in ("本科", "硕士", "博士"):
+        return None
+    start_date = entry.get("start_date")
+    if isinstance(start_date, date):
+        year = start_date.year
+    else:
+        text = str(start_date or "").strip()
+        try:
+            if re.fullmatch(r"\d{4}", text):
+                year = date(int(text), 1, 1).year
+            elif re.fullmatch(r"\d{4}-\d{2}", text):
+                year = date.fromisoformat(text + "-01").year
+            elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+                year = date.fromisoformat(text).year
+            else:
+                return None
+        except ValueError:
+            return None
+    return f"{year % 100:02d}级{degree}生"
 
 
 def _compute_workplace(profiles: dict) -> str:
@@ -501,6 +536,21 @@ def _lookup_profile_field(field_name: str, profiles: dict):
             for entry in cfg["entries"]:
                 if isinstance(entry, dict) and field_name in entry and entry[field_name]:
                     return entry[field_name]
+
+    # Computed cohort labels must not degrade to the bare degree. Application
+    # category is a distinct user fact: a degree never selects an honours category.
+    if field_name == "学历年级":
+        return _compute_grade(profiles)
+    if field_name == "申报类别":
+        for cfg in profiles.values():
+            if not isinstance(cfg, dict):
+                continue
+            if cfg.get("application_category"):
+                return cfg["application_category"]
+            for entry in cfg.get("entries", []):
+                if isinstance(entry, dict) and entry.get("application_category"):
+                    return entry["application_category"]
+        return None
 
     # 通过 match_rules 反查（label 形式 = schema 字段名）
     for pattern, config_file, field_path, transform in match_rules:
@@ -765,13 +815,15 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                 for ci, cell in enumerate(row.cells):
                     cell_iter.append((ri, ci, cell, id(cell._tc)))
 
+        # Keep the original text snapshot: a newly filled value is never a label.
+        original_text = {cell_id: cell.text.strip() for _, _, cell, cell_id in cell_iter}
         for ri, ci, cell, cell_id in cell_iter:
             if cell_id in seen_cells:
                 continue
             seen_cells.add(cell_id)
 
-            text = cell.text.strip()
-            if not _is_likely_label(text):
+            text = _fillable_label(original_text[cell_id])
+            if text is None:
                 continue
 
             # 找到标签，尝试匹配
@@ -785,14 +837,13 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
             # 找相邻单元格填入值
             value_cell = _find_value_cell(table, ri, ci, seen_cells)
             filled_value = None
-            if value_cell and result["value"]:
-                # 清空原有内容
-                for p in value_cell.paragraphs:
-                    for run in p.runs:
-                        run.text = ""
-                if value_cell.paragraphs:
-                    value_cell.paragraphs[0].text = str(result["value"])
+            if value_cell is not None and result["value"] and fill_mode != "literal-mismatch":
+                # Preserve paragraph/run formatting in the existing empty value cell.
+                paragraph = value_cell.paragraphs[0]
+                run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+                run.text = str(result["value"])
                 filled_value = result["value"]
+                seen_cells.add(id(value_cell._tc))
                 status_icon = "✅"
             else:
                 status_icon = "❌"
@@ -810,8 +861,8 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                 prior_reflections: list = []
                 for _ in range(reflexion_rounds):
                     r = reflect_fn(text, filled_value, filled_so_far, prior_reflections)
-                    if not r:
-                        break  # stub: nothing to reflect on
+                    if not r or str(r).strip().upper().rstrip(".。!！") == "OK":
+                        break  # no objection; OK is the model's explicit success token
                     reflection_text = r
                     status_icon = "⚠️"
                     filled_so_far[text] = filled_value
@@ -839,7 +890,7 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
                     "label": text,
                     "value": "",
                     "source": f"{result['config_file']}.yaml (缺失)",
-                    "status": "❌",
+                    "status": "⚠️" if fill_mode == "literal-mismatch" else "❌",
                     "reflection": "",
                     "fill_mode": fill_mode,  # v6.2 R4-A2: routing trace
                 })
@@ -860,20 +911,33 @@ def fill_docx(template_path: str, profiles: dict, output_path: str,
     return safe_audit(audit)
 
 
+def _cell_is_empty_for_fill(cell) -> bool:
+    """A text-empty cell can still contain a picture, field or content control."""
+    if cell.text.strip():
+        return False
+    return not bool(cell._tc.xpath(
+        ".//w:drawing | .//w:pict | .//w:object | .//w:fldChar | .//w:instrText | .//w:sdt | .//w:tbl"
+    ))
+
+
 def _find_value_cell(table, label_row: int, label_col: int, seen_cells: set):
-    """找到标签旁边的值单元格（优先右侧，其次下方）"""
-    # 优先右侧
-    if label_col + 1 < len(table.columns):
-        cell = table.rows[label_row].cells[label_col + 1]
-        if id(cell._tc) not in seen_cells or cell.text.strip() == "":
-            return cell
+    """Select the first distinct adjacent empty cell; never overwrite values/labels.
 
-    # 其次下方
-    if label_row + 1 < len(table.rows):
-        cell = table.rows[label_row + 1].cells[label_col]
-        if id(cell._tc) not in seen_cells or cell.text.strip() == "":
-            return cell
+    Merged aliases of the label itself are skipped. An occupied right-hand cell
+    stops this field rather than sending its value to an unrelated cell below.
+    """
+    label_tc = table.rows[label_row].cells[label_col]._tc
+    for col in range(label_col + 1, len(table.columns)):
+        cell = table.rows[label_row].cells[col]
+        if cell._tc is label_tc:
+            continue
+        return cell if id(cell._tc) not in seen_cells and _cell_is_empty_for_fill(cell) else None
 
+    for row in range(label_row + 1, len(table.rows)):
+        cell = table.rows[row].cells[label_col]
+        if cell._tc is label_tc:
+            continue
+        return cell if id(cell._tc) not in seen_cells and _cell_is_empty_for_fill(cell) else None
     return None
 
 
@@ -938,7 +1002,7 @@ def main():
                         help="v5.0+ Reflexion 自检反思轮数（默认 0 = 关闭，1 = 推荐）")
     parser.add_argument("--audit-out", default=None,
                         help="v5.0+ 填写对照表输出路径（默认 {output_basename}_audit.md）")
-    parser.add_argument("--audit-template", default="templates/audit_table.md",
+    parser.add_argument("--audit-template", default=str(Path(__file__).resolve().parent.parent / "templates/audit_table.md"),
                         help="v5.0+ 对照表模板路径")
     parser.add_argument("--write-profile", action="store_true",
                         help="只生成不含值的本地摘要，旧版明文 profile 副本已停用")
@@ -978,14 +1042,26 @@ def main():
 
     output = args.output or str(local_data_dir() / "outputs" / (__import__("uuid").uuid4().hex + ".docx"))
     audit_path = args.audit_out or (str(Path(output).with_suffix("")) + "_audit.md")
-    inputs = [args.template, args.audit_template, args.mock_canned]
-    inputs.extend(p for p in Path(args.profile_dir).glob("*") if p.is_file())
+    inputs = [args.template]
+    if not args.scan_only:
+        inputs.extend([args.audit_template, args.mock_canned])
+        inputs.extend(p for p in Path(args.profile_dir).glob("*") if p.is_file())
     outputs = [args.introspect_out]
     if not args.scan_only:
         outputs.extend([output, audit_path])
         if args.write_profile:
             outputs.append(Path(output).parent / "profile.md")
     protect_inputs(outputs, inputs)
+
+    # Structural inspection must work on first use, without profiles or model init.
+    if args.scan_only:
+        fields = scan_docx_tables(args.template)
+        if args.introspect_out:
+            intro = scan_docx_introspect(args.template)
+            private_text(args.introspect_out, json.dumps(intro, ensure_ascii=False, indent=2))
+            print("📥 结构摘要已保存本地")
+        print(f"\n📊 共发现 {len(fields)} 个单元格")
+        return
 
     # 加载配置
     print("📂 加载配置文件...")
@@ -1027,10 +1103,6 @@ def main():
             print("📥 结构摘要已保存本地")
         except Exception as exc:
             print("⚠️ 结构摘要写入失败（详情隐藏）")
-
-    if args.scan_only:
-        print(f"\n📊 共发现 {len(fields)} 个单元格")
-        return
 
     # 填写
     print(f"\n✍️ 开始填写...")

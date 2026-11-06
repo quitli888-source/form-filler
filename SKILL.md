@@ -2,7 +2,7 @@
 name: form-filler
 description: 填表Skill版本入口。普通填表路由到form-filler-standard，用户要求绝对隐私、全程本地或不得外发时路由到form-filler-private。实际执行使用skills目录中的对应独立版本。
 metadata:
-  version: "8.0.0"
+  version: "8.0.1"
 ---
 
 # 填表 Skill 版本入口
