@@ -1,0 +1,50 @@
+{
+  "facts": [
+    {
+      "id": "F1",
+      "kind": "education",
+      "text": "合成姓名在合成大学学习化学，目前为本科二年级。",
+      "allow_cloud": true
+    },
+    {
+      "id": "F2",
+      "kind": "experience",
+      "text": "参与课程实验并负责小组数据整理。",
+      "allow_cloud": true
+    },
+    {
+      "id": "F3",
+      "kind": "experience",
+      "text": "不需要外发的其他合成资料。",
+      "allow_cloud": false
+    }
+  ],
+  "replacements": {
+    "{{PERSON_1}}": "合成姓名",
+    "{{SCHOOL_1}}": "合成大学"
+  },
+  "targets": [
+    {
+      "id": "T1",
+      "table": 0,
+      "row": 0,
+      "col": 1,
+      "kind": "infer",
+      "label": "年级",
+      "requirements": "根据已有事实建议年级",
+      "min_chars": 0,
+      "max_chars": 30
+    },
+    {
+      "id": "T2",
+      "table": 0,
+      "row": 1,
+      "col": 1,
+      "kind": "generate",
+      "label": "申请理由",
+      "requirements": "只组织已知学习经历，保留身份占位符，不编造奖项",
+      "min_chars": 0,
+      "max_chars": 300
+    }
+  ]
+}

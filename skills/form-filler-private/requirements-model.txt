@@ -1,0 +1,4 @@
+# Optional LOCAL loopback model client only; no cloud entrypoint in this edition.
+openai>=1.0,<2.0
+httpx>=0.27,<1.0
+json-repair>=0.30
